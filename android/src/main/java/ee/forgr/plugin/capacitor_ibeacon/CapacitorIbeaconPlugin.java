@@ -19,9 +19,9 @@ import com.getcapacitor.annotation.Permission;
 import com.getcapacitor.annotation.PermissionCallback;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import org.altbeacon.beacon.Beacon;
 import org.altbeacon.beacon.BeaconConsumer;
 import org.altbeacon.beacon.BeaconManager;
@@ -42,89 +42,173 @@ import org.altbeacon.beacon.Settings;
         @Permission(alias = "bluetoothConnect", strings = { Manifest.permission.BLUETOOTH_CONNECT })
     }
 )
-public class CapacitorIbeaconPlugin extends Plugin implements BeaconConsumer {
+public class CapacitorIbeaconPlugin extends Plugin {
 
     private final String pluginVersion = "8.1.34";
     private static final String FOREGROUND_CHANNEL_ID = "beacon_service_channel";
     private static final int FOREGROUND_NOTIFICATION_ID = 456;
-    private BeaconManager beaconManager;
-    private Map<String, Region> monitoredRegions = new HashMap<>();
-    private Map<String, Region> rangedRegions = new HashMap<>();
-    private boolean beaconManagerBound = false;
-    private boolean backgroundModeEnabled = false;
-    private boolean foregroundServiceEnabled = false;
-    private boolean isInBackground = false;
+    private static final String IBEACON_LAYOUT = "m:2-3=0215,i:4-19,i:20-21,i:22-23,p:24-24";
+    private static final String TAG = "CapacitorIbeacon";
 
+    // A scan outlives the Activity that started it: foreground service scanning keeps the process,
+    // the service binding and the BeaconManager singleton alive while the Activity - and with it this
+    // plugin instance, its bridge and its WebView - is destroyed and later recreated. All state that
+    // describes the scan therefore lives for as long as the process does, not as long as an instance,
+    // so a recreated instance takes over what its predecessor left running instead of trying to set
+    // it up a second time.
+    private static final Map<String, Region> monitoredRegions = new ConcurrentHashMap<>();
+    private static final Map<String, Region> rangedRegions = new ConcurrentHashMap<>();
+    private static MonitorNotifier monitorNotifier;
+    private static RangeNotifier rangeNotifier;
+    private static BeaconConsumer beaconConsumer;
+    private static boolean beaconManagerBound = false;
+    private static boolean backgroundModeEnabled = false;
+    private static boolean foregroundServiceEnabled = false;
+    private static boolean isInBackground = false;
+
+    // The instance whose bridge is currently alive, or null while no Activity is up. Scan callbacks
+    // are routed through it so they always reach the live WebView, and are dropped when there is none
+    // rather than being handed to a destroyed bridge.
+    private static volatile CapacitorIbeaconPlugin activeInstance;
+
+    private BeaconManager beaconManager;
+
+    // Nothing in here may throw: Bridge.registerPlugin() turns any exception into a PluginLoadException
+    // and then never registers the plugin, so every plugin method would reject with "not implemented on
+    // android" for the rest of the app run.
     @Override
     public void load() {
-        // Initialize beacon manager
-        beaconManager = BeaconManager.getInstanceForApplication(getContext());
+        try {
+            // Initialize beacon manager
+            beaconManager = BeaconManager.getInstanceForApplication(getContext());
+            activeInstance = this;
+            isInBackground = false;
 
-        // Set up iBeacon layout parser
-        beaconManager.getBeaconParsers().add(new BeaconParser().setBeaconLayout("m:2-3=0215,i:4-19,i:20-21,i:22-23,p:24-24"));
-
-        // Configure for background scanning - enable long-running scanning mode
-        // This is critical for beacon detection when app is in background
-        beaconManager.setEnableScheduledScanJobs(false);
-
-        // Prevent Android from downgrading long-running BLE scans to opportunistic mode
-        beaconManager.adjustSettings(new Settings.Builder().setLongScanForcingEnabled(true).build());
-
-        // Configure background scan periods (in milliseconds)
-        // Default background scan: 10 seconds scan, 5 minutes between scans
-        // We use more aggressive settings for better detection
-        beaconManager.setBackgroundBetweenScanPeriod(15000L); // 15 seconds between scans
-        beaconManager.setBackgroundScanPeriod(10000L); // 10 seconds scan duration
-
-        // Configure foreground scan periods
-        beaconManager.setForegroundBetweenScanPeriod(0L); // Continuous scanning in foreground
-        beaconManager.setForegroundScanPeriod(1100L); // Standard scan period
-
-        // bind() is deferred to bindIfNeeded().
-
-        // Set up monitoring and ranging notifiers
-        beaconManager.addMonitorNotifier(
-            new MonitorNotifier() {
-                @Override
-                public void didEnterRegion(Region region) {
-                    notifyDidEnterRegion(region);
-                }
-
-                @Override
-                public void didExitRegion(Region region) {
-                    notifyDidExitRegion(region);
-                }
-
-                @Override
-                public void didDetermineStateForRegion(int state, Region region) {
-                    notifyDidDetermineStateForRegion(state, region);
-                }
+            // Set up iBeacon layout parser, unless it is already in the application-wide list
+            if (!hasIBeaconParser()) {
+                beaconManager.getBeaconParsers().add(new BeaconParser().setBeaconLayout(IBEACON_LAYOUT));
             }
-        );
 
-        beaconManager.addRangeNotifier(
-            new RangeNotifier() {
-                @Override
-                public void didRangeBeaconsInRegion(Collection<Beacon> beacons, Region region) {
-                    notifyDidRangeBeacons(beacons, region);
+            if (beaconManagerBound || beaconManager.isAnyConsumerBound()) {
+                // A scan is already running in this process, so the settings below may no longer be
+                // applied - AltBeacon throws once a consumer is bound. Take over the running scan
+                // instead, including anything a previous process left actively monitored.
+                if (beaconManager.getForegroundServiceNotification() != null) {
+                    foregroundServiceEnabled = true;
                 }
-            }
-        );
+                for (Region region : beaconManager.getMonitoredRegions()) {
+                    monitoredRegions.putIfAbsent(region.getUniqueId(), region);
+                }
+                for (Region region : beaconManager.getRangedRegions()) {
+                    rangedRegions.putIfAbsent(region.getUniqueId(), region);
+                }
+            } else {
+                // Configure for background scanning - enable long-running scanning mode
+                // This is critical for beacon detection when app is in background
+                beaconManager.setEnableScheduledScanJobs(false);
 
-        Boolean configBackgroundMode = getConfig().getBoolean("enableBackgroundMode", false);
-        if (configBackgroundMode != null && configBackgroundMode) {
-            backgroundModeEnabled = true;
+                // Prevent Android from downgrading long-running BLE scans to opportunistic mode
+                beaconManager.adjustSettings(new Settings.Builder().setLongScanForcingEnabled(true).build());
+
+                // Configure background scan periods (in milliseconds)
+                // Default background scan: 10 seconds scan, 5 minutes between scans
+                // We use more aggressive settings for better detection
+                beaconManager.setBackgroundBetweenScanPeriod(15000L); // 15 seconds between scans
+                beaconManager.setBackgroundScanPeriod(10000L); // 10 seconds scan duration
+
+                // Configure foreground scan periods
+                beaconManager.setForegroundBetweenScanPeriod(0L); // Continuous scanning in foreground
+                beaconManager.setForegroundScanPeriod(1100L); // Standard scan period
+            }
+
+            // bind() is deferred to bindIfNeeded().
+
+            addNotifiersIfNeeded();
+
+            Boolean configBackgroundMode = getConfig().getBoolean("enableBackgroundMode", false);
+            if (configBackgroundMode != null && configBackgroundMode) {
+                backgroundModeEnabled = true;
+            }
+
+            applyBackgroundMode(backgroundModeEnabled);
+        } catch (Exception e) {
+            android.util.Log.e(TAG, "Beacon monitoring was not fully initialized", e);
         }
     }
 
     @Override
     protected void handleOnDestroy() {
-        applyBackgroundMode(false);
-        if (beaconManager != null && beaconManagerBound) {
-            beaconManager.unbind(this);
-            beaconManagerBound = false;
+        // Stop routing callbacks at a bridge that is about to die. The scan itself, its binding and its
+        // notifiers stay in place for the next instance to take over - that is what makes monitoring
+        // survive the Activity - unless nothing is left to watch, or unless it is running without a
+        // foreground service and so has no business outliving the Activity in the first place.
+        if (activeInstance == this) {
+            activeInstance = null;
+        }
+        isInBackground = true;
+
+        if (!foregroundServiceEnabled || (monitoredRegions.isEmpty() && rangedRegions.isEmpty())) {
+            unbindIfNeeded();
+        } else {
+            applyBackgroundMode(backgroundModeEnabled);
         }
         super.handleOnDestroy();
+    }
+
+    private boolean hasIBeaconParser() {
+        for (BeaconParser parser : beaconManager.getBeaconParsers()) {
+            if (IBEACON_LAYOUT.equals(parser.getLayout())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // The notifier sets are application-wide, so a single pair per process is registered and left in
+    // place. They hold no reference to any instance: each callback is dispatched to whichever instance
+    // is live at that moment, so a destroyed one is never called and never leaks through them.
+    private void addNotifiersIfNeeded() {
+        if (monitorNotifier == null) {
+            monitorNotifier = new MonitorNotifier() {
+                @Override
+                public void didEnterRegion(Region region) {
+                    CapacitorIbeaconPlugin plugin = activeInstance;
+                    if (plugin != null) {
+                        plugin.notifyDidEnterRegion(region);
+                    }
+                }
+
+                @Override
+                public void didExitRegion(Region region) {
+                    CapacitorIbeaconPlugin plugin = activeInstance;
+                    if (plugin != null) {
+                        plugin.notifyDidExitRegion(region);
+                    }
+                }
+
+                @Override
+                public void didDetermineStateForRegion(int state, Region region) {
+                    CapacitorIbeaconPlugin plugin = activeInstance;
+                    if (plugin != null) {
+                        plugin.notifyDidDetermineStateForRegion(state, region);
+                    }
+                }
+            };
+            beaconManager.addMonitorNotifier(monitorNotifier);
+        }
+
+        if (rangeNotifier == null) {
+            rangeNotifier = new RangeNotifier() {
+                @Override
+                public void didRangeBeaconsInRegion(Collection<Beacon> beacons, Region region) {
+                    CapacitorIbeaconPlugin plugin = activeInstance;
+                    if (plugin != null) {
+                        plugin.notifyDidRangeBeacons(beacons, region);
+                    }
+                }
+            };
+            beaconManager.addRangeNotifier(rangeNotifier);
+        }
     }
 
     @Override
@@ -141,24 +225,37 @@ public class CapacitorIbeaconPlugin extends Plugin implements BeaconConsumer {
         applyBackgroundMode(backgroundModeEnabled);
     }
 
-    @Override
-    public void onBeaconServiceConnect() {
-        // beaconManagerBound is already set synchronously wherever bind() is called.
-    }
+    // The consumer holds the service binding, so it must not be tied to the Activity: binding from an
+    // Activity context makes Android tear the binding down when that Activity is destroyed, while
+    // AltBeacon goes on listing the consumer as bound. One application-scoped consumer per process
+    // keeps the binding and AltBeacon's view of it in agreement.
+    private static final class ApplicationBeaconConsumer implements BeaconConsumer {
 
-    @Override
-    public Context getApplicationContext() {
-        return getContext();
-    }
+        private final Context applicationContext;
 
-    @Override
-    public void unbindService(ServiceConnection serviceConnection) {
-        getContext().unbindService(serviceConnection);
-    }
+        private ApplicationBeaconConsumer(Context context) {
+            this.applicationContext = context.getApplicationContext();
+        }
 
-    @Override
-    public boolean bindService(android.content.Intent intent, ServiceConnection serviceConnection, int i) {
-        return getContext().bindService(intent, serviceConnection, i);
+        @Override
+        public void onBeaconServiceConnect() {
+            // beaconManagerBound is already set synchronously wherever bind() is called.
+        }
+
+        @Override
+        public Context getApplicationContext() {
+            return applicationContext;
+        }
+
+        @Override
+        public void unbindService(ServiceConnection serviceConnection) {
+            applicationContext.unbindService(serviceConnection);
+        }
+
+        @Override
+        public boolean bindService(Intent intent, ServiceConnection serviceConnection, int flags) {
+            return applicationContext.bindService(intent, serviceConnection, flags);
+        }
     }
 
     @PluginMethod
@@ -721,10 +818,24 @@ public class CapacitorIbeaconPlugin extends Plugin implements BeaconConsumer {
         if (beaconManagerBound || beaconManager == null) {
             return;
         }
+        if (beaconConsumer == null) {
+            beaconConsumer = new ApplicationBeaconConsumer(getContext());
+        }
         // Set before bind() - AltBeacon is synchronously bound inside bind() itself, not only
         // once onBeaconServiceConnect() fires.
         beaconManagerBound = true;
-        beaconManager.bind(this);
+        beaconManager.bind(beaconConsumer);
+    }
+
+    private void unbindIfNeeded() {
+        if (beaconManager == null) {
+            return;
+        }
+        if (beaconManagerBound && beaconConsumer != null) {
+            beaconManager.unbind(beaconConsumer);
+            beaconManagerBound = false;
+        }
+        disableForegroundServiceIfNeeded();
     }
 
     private void setBackgroundModeEnabled(boolean enabled) {
@@ -752,8 +863,8 @@ public class CapacitorIbeaconPlugin extends Plugin implements BeaconConsumer {
     // while unbound. Re-registers any regions that were actively monitored/ranged before the cycle.
     private boolean reconfigureForegroundService(boolean wantForegroundService) {
         boolean wasBound = beaconManagerBound;
-        if (wasBound) {
-            beaconManager.unbind(this);
+        if (wasBound && beaconConsumer != null) {
+            beaconManager.unbind(beaconConsumer);
             beaconManagerBound = false;
         }
         boolean success = true;
@@ -762,9 +873,9 @@ public class CapacitorIbeaconPlugin extends Plugin implements BeaconConsumer {
         } else {
             disableForegroundServiceIfNeeded();
         }
-        if (wasBound) {
+        if (wasBound && beaconConsumer != null) {
             beaconManagerBound = true;
-            beaconManager.bind(this);
+            beaconManager.bind(beaconConsumer);
             for (Region region : monitoredRegions.values()) {
                 beaconManager.startMonitoring(region);
             }
@@ -805,7 +916,7 @@ public class CapacitorIbeaconPlugin extends Plugin implements BeaconConsumer {
             foregroundServiceEnabled = true;
             return true;
         } catch (Exception e) {
-            android.util.Log.w("CapacitorIbeacon", "Foreground service scanning unavailable, continuing without it", e);
+            android.util.Log.w(TAG, "Foreground service scanning unavailable, continuing without it", e);
             return false;
         }
     }
@@ -818,7 +929,7 @@ public class CapacitorIbeaconPlugin extends Plugin implements BeaconConsumer {
         try {
             beaconManager.disableForegroundServiceScanning();
         } catch (Exception e) {
-            android.util.Log.w("CapacitorIbeacon", "Failed to disable foreground service scanning", e);
+            android.util.Log.w(TAG, "Failed to disable foreground service scanning", e);
         } finally {
             foregroundServiceEnabled = false;
         }
