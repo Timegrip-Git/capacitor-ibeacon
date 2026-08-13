@@ -50,6 +50,18 @@ public class CapacitorIbeaconPlugin extends Plugin {
     private static final String IBEACON_LAYOUT = "m:2-3=0215,i:4-19,i:20-21,i:22-23,p:24-24";
     private static final String TAG = "CapacitorIbeacon";
 
+    /*
+      A region counts as exited purely on "not seen for longer than this", evaluated at the end of a
+      scan cycle - there is no consecutive-miss requirement. It therefore has to clear a whole cycle
+      (scan period + between period, 25s in the background below) with room to spare, or a single
+      advertisement going missing is reported as an exit immediately followed by an enter, from a
+      device that never moved. AltBeacon's own default is 10s, which does not clear one cycle.
+
+      Two cycles of tolerance delays a genuine exit by up to a minute. That is the better error: a
+      late exit is still true, a spurious one never was.
+    */
+    private static final long REGION_EXIT_PERIOD = 60000L;
+
     // A scan outlives the Activity that started it: foreground service scanning keeps the process,
     // the service binding and the BeaconManager singleton alive while the Activity - and with it this
     // plugin instance, its bridge and its WebView - is destroyed and later recreated. All state that
@@ -88,6 +100,10 @@ public class CapacitorIbeaconPlugin extends Plugin {
             if (!hasIBeaconParser()) {
                 beaconManager.getBeaconParsers().add(new BeaconParser().setBeaconLayout(IBEACON_LAYOUT));
             }
+
+            // Unlike the scan settings below, this is a static that takes effect immediately, so it
+            // is applied whether or not a scan is already running.
+            BeaconManager.setRegionExitPeriod(REGION_EXIT_PERIOD);
 
             if (beaconManagerBound || beaconManager.isAnyConsumerBound()) {
                 // A scan is already running in this process, so the settings below may no longer be
@@ -172,7 +188,7 @@ public class CapacitorIbeaconPlugin extends Plugin {
             monitorNotifier = new MonitorNotifier() {
                 @Override
                 public void didEnterRegion(Region region) {
-                    CapacitorIbeaconPlugin plugin = activeInstance;
+                    CapacitorIbeaconPlugin plugin = dispatchTarget("didEnterRegion", region.getUniqueId());
                     if (plugin != null) {
                         plugin.notifyDidEnterRegion(region);
                     }
@@ -180,7 +196,7 @@ public class CapacitorIbeaconPlugin extends Plugin {
 
                 @Override
                 public void didExitRegion(Region region) {
-                    CapacitorIbeaconPlugin plugin = activeInstance;
+                    CapacitorIbeaconPlugin plugin = dispatchTarget("didExitRegion", region.getUniqueId());
                     if (plugin != null) {
                         plugin.notifyDidExitRegion(region);
                     }
@@ -188,7 +204,10 @@ public class CapacitorIbeaconPlugin extends Plugin {
 
                 @Override
                 public void didDetermineStateForRegion(int state, Region region) {
-                    CapacitorIbeaconPlugin plugin = activeInstance;
+                    CapacitorIbeaconPlugin plugin = dispatchTarget(
+                        "didDetermineStateForRegion(" + (state == MonitorNotifier.INSIDE ? "inside" : "outside") + ")",
+                        region.getUniqueId()
+                    );
                     if (plugin != null) {
                         plugin.notifyDidDetermineStateForRegion(state, region);
                     }
@@ -209,6 +228,19 @@ public class CapacitorIbeaconPlugin extends Plugin {
             };
             beaconManager.addRangeNotifier(rangeNotifier);
         }
+    }
+
+    /*
+      Region events only reach JS while an Activity is up: the scan keeps running behind a destroyed
+      one, but Plugin.notifyListeners() discards an event that has no listener, so it is lost rather
+      than delayed. Whether that happened is otherwise invisible - Capacitor's own logging is off in
+      a release build - hence this log line at the one point where it can still be told. Region
+      transitions are rare enough for this to be cheap. Ranging is deliberately not logged.
+    */
+    private static CapacitorIbeaconPlugin dispatchTarget(String event, String regionIdentifier) {
+        CapacitorIbeaconPlugin plugin = activeInstance;
+        android.util.Log.i(TAG, event + " " + regionIdentifier + (plugin == null ? ": dropped, no live bridge" : ": to bridge"));
+        return plugin;
     }
 
     @Override
