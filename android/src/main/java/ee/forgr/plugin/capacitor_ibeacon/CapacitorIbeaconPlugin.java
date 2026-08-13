@@ -712,8 +712,8 @@ public class CapacitorIbeaconPlugin extends Plugin {
 
     @PluginMethod
     public void setBackgroundScanPeriod(PluginCall call) {
-        Long scanPeriod = call.getLong("scanPeriod", 10000L);
-        Long betweenScanPeriod = call.getLong("betweenScanPeriod", 15000L);
+        long scanPeriod = longOptionFromCall(call, "scanPeriod", 10000L);
+        long betweenScanPeriod = longOptionFromCall(call, "betweenScanPeriod", 15000L);
 
         try {
             beaconManager.setBackgroundScanPeriod(scanPeriod);
@@ -739,6 +739,12 @@ public class CapacitorIbeaconPlugin extends Plugin {
     }
 
     // Helper methods
+
+    // Capacitor's PluginCall.getLong() only reads Java Long values. JS numbers that
+    // fit in 32 bits cross the bridge as Integer, so optLong is required.
+    static long longOptionFromCall(PluginCall call, String key, long defaultValue) {
+        return call.getData().optLong(key, defaultValue);
+    }
 
     private boolean hasBluetoothPermissions() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
