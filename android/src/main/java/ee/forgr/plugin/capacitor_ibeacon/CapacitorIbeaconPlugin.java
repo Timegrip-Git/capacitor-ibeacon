@@ -52,15 +52,17 @@ public class CapacitorIbeaconPlugin extends Plugin {
 
     /*
       A region counts as exited purely on "not seen for longer than this", evaluated at the end of a
-      scan cycle - there is no consecutive-miss requirement. It therefore has to clear a whole cycle
-      (scan period + between period, 25s in the background below) with room to spare, or a single
-      advertisement going missing is reported as an exit immediately followed by an enter, from a
-      device that never moved. AltBeacon's own default is 10s, which does not clear one cycle.
+      scan cycle - there is no consecutive-miss requirement, so this is the entire tolerance for a
+      beacon that is present but momentarily unheard. Measured over a night with a static phone and
+      two beacons in range: missing a few listening windows in a row left it deaf for 60-80s at a
+      time, one outlier at 183s, and both beacons went deaf in the same millisecond - it is the
+      phone's receiver, not the beacons. AltBeacon's own default of 10s is far below that, and 60s
+      still produced an exit followed by an enter 28 milliseconds later.
 
-      Two cycles of tolerance delays a genuine exit by up to a minute. That is the better error: a
-      late exit is still true, a spurious one never was.
+      Three minutes covers all but that outlier, at the price of reporting a genuine exit that much
+      later. That is the better error: a late exit is still true, a spurious one never was.
     */
-    private static final long REGION_EXIT_PERIOD = 60000L;
+    private static final long REGION_EXIT_PERIOD = 180000L;
 
     // A scan outlives the Activity that started it: foreground service scanning keeps the process,
     // the service binding and the BeaconManager singleton alive while the Activity - and with it this
@@ -91,6 +93,18 @@ public class CapacitorIbeaconPlugin extends Plugin {
     @Override
     public void load() {
         try {
+            /*
+              For diagnosing what a scan actually heard - AltBeacon states why it declared a region
+              exited, and how long ago the region was last seen, which is the difference between an
+              exit period that is too tight and a scan that stopped receiving. It logs a line per scan
+              cycle and per detection, so this is meant for a diagnostic run rather than for good.
+            */
+            Boolean configDebugLogging = getConfig().getBoolean("enableDebugLogging", false);
+            boolean debugLogging = configDebugLogging != null && configDebugLogging;
+            if (debugLogging) {
+                BeaconManager.setDebug(true);
+            }
+
             // Initialize beacon manager
             beaconManager = BeaconManager.getInstanceForApplication(getContext());
             activeInstance = this;
@@ -128,13 +142,22 @@ public class CapacitorIbeaconPlugin extends Plugin {
 
                 // Configure background scan periods (in milliseconds)
                 // Default background scan: 10 seconds scan, 5 minutes between scans
-                // We use more aggressive settings for better detection
-                beaconManager.setBackgroundBetweenScanPeriod(15000L); // 15 seconds between scans
+                // We listen for most of the cycle rather than the 40% a 15 second gap left: a beacon
+                // heard in only some windows is otherwise taken for gone, and every spurious exit
+                // measured so far came from missing a few windows in a row - see REGION_EXIT_PERIOD.
+                beaconManager.setBackgroundBetweenScanPeriod(5000L); // 5 seconds between scans
                 beaconManager.setBackgroundScanPeriod(10000L); // 10 seconds scan duration
 
                 // Configure foreground scan periods
                 beaconManager.setForegroundBetweenScanPeriod(0L); // Continuous scanning in foreground
                 beaconManager.setForegroundScanPeriod(1100L); // Standard scan period
+            }
+
+            // Again, deliberately: a Settings object carries a debug flag of its own, so the
+            // adjustSettings() above silently turns logging back off. That is how the first
+            // diagnostic run came back with nothing logged past load().
+            if (debugLogging) {
+                BeaconManager.setDebug(true);
             }
 
             // bind() is deferred to bindIfNeeded().
