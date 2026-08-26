@@ -22,10 +22,19 @@ public class CapacitorIbeaconPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "getPluginVersion", returnType: CAPPluginReturnPromise)
     ]
 
-    private let implementation = CapacitorIbeacon()
+    // The shared instance, not one of its own: monitoring outlives any bridge, see CapacitorIbeacon.
+    private let implementation = CapacitorIbeacon.shared
 
     override public func load() {
         implementation.setPlugin(self)
+    }
+
+    // A bridge is torn down whenever the app is relaunched into the background, and the singleton
+    // must not keep routing JS events at a dead one.
+    deinit {
+        if CapacitorIbeacon.shared.isCurrentPlugin(self) {
+            CapacitorIbeacon.shared.setPlugin(nil)
+        }
     }
 
     @objc func startMonitoringForRegion(_ call: CAPPluginCall) {
@@ -127,15 +136,15 @@ public class CapacitorIbeaconPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     @objc func requestWhenInUseAuthorization(_ call: CAPPluginCall) {
-        implementation.requestWhenInUseAuthorization()
-        let status = implementation.getAuthorizationStatus()
-        call.resolve(["status": status])
+        implementation.requestWhenInUseAuthorization { status in
+            call.resolve(["status": status])
+        }
     }
 
     @objc func requestAlwaysAuthorization(_ call: CAPPluginCall) {
-        implementation.requestAlwaysAuthorization()
-        let status = implementation.getAuthorizationStatus()
-        call.resolve(["status": status])
+        implementation.requestAlwaysAuthorization { status in
+            call.resolve(["status": status])
+        }
     }
 
     @objc func getAuthorizationStatus(_ call: CAPPluginCall) {
