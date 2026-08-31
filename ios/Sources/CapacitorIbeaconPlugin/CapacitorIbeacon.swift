@@ -634,8 +634,12 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
 
       A CLServiceSession with an always requirement makes Location Services seek that authorization,
       and holding it is separately mandatory for receiving monitor events while not in-use - so the
-      request and the thing that makes the grant usable are the same object, and taking it here is
-      what marks always-operation as configured for later launches.
+      request and the thing that makes the grant usable are the same object.
+
+      What it is not is an answer. The session is created while the status is still undecided, which
+      is precisely what makes iOS ask - so always-operation cannot be marked as configured here
+      without claiming a grant the user is still free to refuse. It is marked when the grant arrives
+      instead, in locationManagerDidChangeAuthorization.
 
       When-in-use is still requested first if nothing has been decided yet, because iOS escalates to
       always from an existing grant rather than straight from undecided.
@@ -645,7 +649,7 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
             if self.currentAuthorizationStatus() == .notDetermined {
                 self.locationManager.requestWhenInUseAuthorization()
             }
-            self.takeServiceSession(recordAsConfigured: true)
+            self.takeServiceSession(recordAsConfigured: false)
         }
     }
 
@@ -656,10 +660,31 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
     ) {
         let current = currentAuthorizationStatus()
 
-        // Already answered - asking again shows nothing and reports nothing. The session is still
-        // taken, since a granted "always" without one delivers no events in the background.
-        if current != .notDetermined, current == target || target == .authorizedWhenInUse {
-            if target == .authorizedAlways {
+        /*
+          Answered already, so nothing is asked and the completion is settled from what is known.
+
+          Two ways to be answered. The grant covers the request, which is the ordinary case of a
+          frontend re-asserting its permissions on every launch. Or the request is refused outright:
+          iOS shows no prompt to an app that is denied or restricted, and reports no authorization
+          change either, so waiting for the delegate means waiting out the whole timeout and then
+          reporting the very status that was readable here from the start - a minute of a promise
+          that never resolves, for a question that was settled before it was asked.
+        */
+        let refused = current == .denied || current == .restricted
+        let covered = current != .notDetermined && (current == target || target == .authorizedWhenInUse)
+
+        if refused || covered {
+            /*
+              Only a grant in hand justifies a session. Taking one under a refusal earns nothing but
+              authorizationDenied diagnostics, and recording it as configured would be worse: that
+              flag is the evidence retakeServiceSessionIfConfigured() relies on to take a session
+              during a background relaunch, and it is meant to say a matching session was
+              legitimately held in an earlier run. A refusal never held one.
+
+              Recorded here rather than left to the delegate because nothing is changing, so no
+              delegate callback is coming.
+            */
+            if current == .authorizedAlways, target == .authorizedAlways {
                 takeServiceSession(recordAsConfigured: true)
             }
             completion(getAuthorizationStatus())
@@ -845,6 +870,20 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
         // downgrade the user makes in Settings while the app runs arrives here and nowhere else, and
         // it stops monitoring reporting anything without a single other symptom.
         auditMonitoring("authorization changed")
+
+        /*
+          Where always-operation is recorded as configured, for the same reason as the audit above:
+          this is the one place the answer to the request lands, and it lands here whether it comes
+          moments later from the prompt or hours later from Settings - the latter arriving with no
+          callbacks outstanding at all, past the guard below.
+
+          Conditioned on holding a session as well as on the grant, so that only an always-operation
+          this process actually asked for is recorded. A user who grants "always" in Settings to an
+          app that never wanted it leaves nothing behind for the next launch to act on.
+        */
+        if status == .authorizedAlways, serviceSession != nil {
+            UserDefaults.standard.set(true, forKey: CapacitorIbeacon.alwaysConfiguredKey)
+        }
 
         guard !authorizationCallbacks.isEmpty, status != .notDetermined else { return }
 
