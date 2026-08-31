@@ -139,9 +139,32 @@ public enum CapacitorIbeaconDiagnosticLog {
               moments later is announced or swallowed. The pid matches the one NSLog prints.
             */
             appendLine("--- process \(ProcessInfo.processInfo.processIdentifier) started ---", to: url, at: timestamp)
+
+            // Once per process, and after the line above has guaranteed the file exists. The
+            // creation path below covers a file this process makes; this covers one it inherited,
+            // including the logs already sitting on devices from builds that wrote them unmarked.
+            excludeFromBackup(url)
         }
 
         appendLine(message, to: url, at: timestamp)
+    }
+
+    /*
+      Kept out of iCloud and iTunes backups.
+
+      Documents is backed up by default, and this file is a timestamped record of when its owner
+      arrived at and left a place. A movement trace has no business being copied off the device and
+      restored onto the next one - it is written here to be read here, by someone holding the phone.
+
+      Not paired with a file protection class, deliberately: Documents already defaults to
+      completeUntilFirstUserAuthentication, and anything stricter would fail exactly the writes this
+      log exists for, in a process iOS relaunched into the background against a locked screen.
+    */
+    private static func excludeFromBackup(_ url: URL) {
+        var target = url
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try? target.setResourceValues(values)
     }
 
     private static func appendLine(_ message: String, to url: URL, at timestamp: Date) {
@@ -164,6 +187,10 @@ public enum CapacitorIbeaconDiagnosticLog {
             try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
                                                      withIntermediateDirectories: true)
             try? data.write(to: url)
+            // Marked as the file is made, which is also what marks the replacement rotate() leaves
+            // behind. The rotated generation needs nothing of its own: the move is a rename, and the
+            // attribute travels with it.
+            excludeFromBackup(url)
             return
         }
 

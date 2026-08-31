@@ -106,6 +106,24 @@ class CapacitorIbeaconDiagnosticLogTests: XCTestCase {
         XCTAssertEqual(readLog(), "")
     }
 
+    /*
+      Documents is backed up by default, and this file records where its owner has been.
+
+      Worth a test because nothing would notice it missing: no behaviour changes and no error is
+      raised, the trace simply starts syncing to iCloud and restoring onto the next device. The
+      attribute is the only evidence either way.
+    */
+    func testKeepsTheLogOutOfBackups() throws {
+        CapacitorIbeaconDiagnosticLog.isEnabled = true
+
+        CapacitorIbeaconDiagnosticLog.write("a walk that stays on this phone")
+        CapacitorIbeaconDiagnosticLog.flush()
+
+        let url = try XCTUnwrap(CapacitorIbeaconDiagnosticLog.fileURL)
+        let excluded = try url.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup
+        XCTAssertEqual(excluded, true)
+    }
+
     func testResetEmptiesTheLog() {
         CapacitorIbeaconDiagnosticLog.isEnabled = true
         CapacitorIbeaconDiagnosticLog.write("before the reset")
