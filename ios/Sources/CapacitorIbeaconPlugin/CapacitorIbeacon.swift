@@ -488,13 +488,29 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
                 }
 
                 /*
+                  This process's record of the state is enqueued before the condition exists, and
+                  that order is the whole point.
+
+                  Both this write and handle() run on the main queue, so the queue orders them by
+                  when they were enqueued rather than by where they sit in this function. Enqueued
+                  after the add, a .satisfied arriving in between is announced first and then
+                  overwritten here: the region then reads as outside while the user is standing in
+                  it, so the next repeat of that state is announced as a second enter, and the real
+                  exit is dropped for having no stay to end. Enqueued before the add, no event for
+                  this identifier can exist yet, so nothing can get in front of it.
+
+                  After the remove above rather than before it, so that a removal which ends a stay
+                  is still judged against the state that stay was announced with.
+                */
+                DispatchQueue.main.async { self?.announcedInside[identifier] = false }
+
+                /*
                   Seeded as unsatisfied, so that a region the user is already standing in reports
                   itself. Monitoring speaks on change, and assuming the opposite of what is likely
                   true is what turns the first observation into an event - the same reason the old
                   code seeded a state and then asked for it outright, minus the asking.
                 */
                 await monitor.add(condition, identifier: identifier, assuming: .unsatisfied)
-                DispatchQueue.main.async { self?.announcedInside[identifier] = false }
                 beaconLog("CapacitorIbeacon: startMonitoring %@ - NEW, assumed outside", identifier)
             }
 
