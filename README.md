@@ -21,6 +21,10 @@ The most complete doc is available here: https://capgo.app/docs/plugins/ibeacon/
 | v6.\*.\*       | v6.\*.\*                | ❌          |
 | v5.\*.\*       | v5.\*.\*                | ❌          |
 
+> **iOS 18 or later is required.** Region monitoring is built on `CLMonitor` and authorization on
+> `CLServiceSession`, both of which need iOS 18 for the per-event diagnostics the plugin relies on to
+> tell "the beacon is not here" apart from "iOS is unable to say". Android is unaffected.
+
 > **Note:** The major version of this plugin follows the major version of Capacitor. Use the version that matches your Capacitor installation (e.g., plugin v8 for Capacitor 8). Only the latest major version is actively maintained.
 
 ## Install
@@ -87,6 +91,33 @@ Add the following keys to your `ios/App/App/Info.plist` file:
    - ✅ **Location updates** (required for background beacon monitoring)
    - ✅ **Uses Bluetooth LE accessories** (required for beacon detection)
 
+#### Step 3: Start monitoring from your AppDelegate
+
+**Required.** Monitoring has to exist before the Capacitor bridge does. iOS relaunches a terminated
+app in the background to deliver a beacon crossing, within moments and long before a WebView and a
+remotely hosted frontend could be ready, and `CLMonitor` is explicit that CoreLocation *stops*
+monitoring a condition when an event is pending and nothing has opened the monitor to receive it. So
+skipping this does not merely miss one crossing - it ends monitoring until something re-registers.
+
+```swift
+import Capacitor
+import CapgoCapacitorIbeacon
+
+@UIApplicationMain
+class AppDelegate: UIResponder, UIApplicationDelegate {
+    func application(_ application: UIApplication,
+                     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
+        CapacitorIbeacon.shared.start()
+        return true
+    }
+}
+```
+
+Regions are adopted from the conditions iOS has persisted, so monitoring re-asserts itself on every
+launch without the frontend having to ask - and keeps working even if the frontend never loads.
+Region events are also posted on `NotificationCenter` under `CapacitorIbeaconRegionEvent`, so native
+code in the host app can observe them without owning any of this.
+
 #### Permissions Required
 
 - **When In Use**: For foreground beacon ranging and monitoring
@@ -95,7 +126,29 @@ Add the following keys to your `ios/App/App/Info.plist` file:
 - **Precise Location**: Required. See below - beacons do not work without it, and an "Always" grant
   is not enough on its own.
 
-#### Precise Location must be on (iOS 14+)
+#### Ranging is a foreground feature on iOS
+
+Ranging (continuous proximity and RSSI, the `didRangeBeacons` event) only produces measurements while
+the app process is running. iOS suspends the process shortly after it leaves the foreground, and
+Apple's position is that background beacon ranging is not supported: on iOS 18 the ranging callback
+keeps firing with **empty** beacon arrays once the display goes off, so it is the scan rather than
+the process that stops. No background mode, session object or keep-alive changes this.
+
+What the plugin does with that:
+
+- **In the foreground**, entering a monitored region starts ranging it automatically, and leaving
+  stops it. Backgrounding suspends it; returning resumes it.
+- **In the background**, a crossing gets a single ~10 second burst of ranging - the wake window the
+  monitoring event itself provides - which captures the beacon's proximity at the moment of the
+  crossing and then stops. Nothing is kept alive artificially.
+- `startRangingBeaconsInRegion` / `stopRangingBeaconsInRegion` still work exactly as before and are
+  tracked separately from the automatic behaviour, so an exit never cancels ranging you asked for,
+  and your `stop` never cancels ranging a region occupancy still justifies.
+
+If you need proximity at a moment when the app is not in the foreground, use the region crossing
+itself as the signal - that is what it is for - rather than expecting a ranging stream.
+
+#### Precise Location must be on
 
 iOS will not monitor or range iBeacon regions when the user has turned **Precise Location** off, and
 it reports this nowhere: no error, no failure callback, just silence that looks exactly like a beacon
@@ -162,6 +215,11 @@ await CapacitorIbeacon.stopMonitoringForRegion({
 
 Start ranging beacons in a region. Provides continuous distance updates.
 
+On iOS this is foreground-only in practice - see [Ranging is a foreground feature on
+iOS](#ranging-is-a-foreground-feature-on-ios). Entering a monitored region already starts ranging it
+automatically while the app is in the foreground, so this call is for ranging a region you are not
+monitoring, or for keeping ranging on across a region exit.
+
 ```typescript
 await CapacitorIbeacon.startRangingBeaconsInRegion({
   identifier: 'MyBeaconRegion',
@@ -211,6 +269,12 @@ console.log('Authorization status:', status);
 ```
 
 ### requestAlwaysAuthorization()
+
+On iOS this also takes the `CLServiceSession` that iOS 18 requires: an app holding "always"
+authorization but no session receives **no** monitoring events while it is not in-use. The plugin
+records that always-operation was configured and re-takes the session on every launch, including
+background relaunches - so call this once from the foreground when the user opts into background
+monitoring, and the plugin keeps it held from then on.
 
 Request "Always" location authorization (required for background monitoring).
 

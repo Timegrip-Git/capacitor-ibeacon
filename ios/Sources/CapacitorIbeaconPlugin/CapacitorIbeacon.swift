@@ -3,15 +3,24 @@ import CoreLocation
 import CoreBluetooth
 import UIKit
 
-public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheralManagerDelegate {
+/*
+  Sendable by confinement rather than by construction.
+
+  CLMonitor and CLServiceSession are async, so their events are read inside Tasks - which makes the
+  compiler ask how this class can be touched from them. The answer is that it never is: every Task
+  here awaits, snapshots what it needs into values, and hands those to DispatchQueue.main. All
+  mutable state is therefore read and written on the main queue only, alongside the Core Location
+  delegate callbacks and the plugin calls, which arrive there already.
+*/
+public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheralManagerDelegate, @unchecked Sendable {
 
     /*
       One instance per process, not one per bridge.
 
-      Core Location keeps monitoring the app's regions after the app is terminated, and relaunches it
-      in the background to deliver a crossing - within moments, and long before a Capacitor bridge,
-      its WebView and a remote frontend could be ready. A CLLocationManager created with the bridge
-      therefore does not exist when the event arrives, and the event is delivered nowhere and lost.
+      Core Location keeps monitoring the app's conditions after the app is terminated, and relaunches
+      it in the background to deliver a crossing - within moments, and long before a Capacitor bridge,
+      its WebView and a remote frontend could be ready. Anything created with the bridge therefore
+      does not exist when the event arrives, and the event is delivered nowhere and lost.
 
       So monitoring lives for as long as the process does, and the bridge attaches to it when there
       happens to be one - the counterpart of holding the scan state in statics on Android, where the
@@ -20,29 +29,122 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
     */
     public static let shared = CapacitorIbeacon()
 
-    private var locationManager: CLLocationManager!
+    // MARK: - Monitoring
+
+    /*
+      Monitoring is CLMonitor's, not CLLocationManager's.
+
+      CLLocationManager's startMonitoring(for:)/stopMonitoring(for:)/requestState(for:) and
+      CLBeaconRegion itself are all marked deprecated toward CLMonitor and CLBeaconIdentityCondition.
+      They carry API_TO_BE_DEPRECATED, which names no version and so emits no warning - the entire
+      monitoring core was quietly on the way out while the compiler said nothing.
+
+      The move is not only about staying current. Conditions are keyed by identifier, which is what
+      this plugin's own API is keyed by; their state is persisted by the framework across termination;
+      and on iOS 18 each event explains its own silence (see describeDiagnostics). All three were
+      hand-rolled here before, and the last one could not be done at all.
+    */
+    private static let monitorName = "CapacitorIbeaconMonitor"
+    private var monitor: CLMonitor?
+    private var monitorTask: Task<Void, Never>?
+    // Mirrors the conditions handed to CLMonitor, so the identifier-keyed API can answer questions
+    // without awaiting the monitor. CLMonitor remains the authority; this is a cache.
+    var conditions: [String: CLMonitor.BeaconIdentityCondition] = [:]
+    /*
+      Whether an enter has been announced for an identifier, so nothing is announced twice.
+
+      CLMonitor delivers state, and the same state can arrive more than once - a repeated .satisfied
+      must not become a second enter, which for a consuming app means a second push notification. The
+      framework's own record(for:) is not used for this: it is updated around event delivery, so
+      comparing an event against it invites the off-by-one that let one event validate the next.
+    */
+    var announcedInside: [String: Bool] = [:]
+
+    // MARK: - Authorization state
+
+    var locationManager: CLLocationManager!
     private var peripheralManager: CBPeripheralManager!
-    private weak var plugin: CapacitorIbeaconPlugin?
-    private var monitoredRegions: [String: CLBeaconRegion] = [:]
-    private var rangedRegions: [String: CLBeaconRegion] = [:]
+    weak var plugin: CapacitorIbeaconPlugin?
     private var peripheralManagerReadyCallbacks: [(CBPeripheralManager) -> Void] = []
     // The first CBPeripheralManager of an app's life also waits for the user to answer the Bluetooth
     // prompt, which takes longer than a few seconds. Too short a timeout reports the .unknown state
     // as "Bluetooth is off" while it is merely undecided.
     private let peripheralManagerStateTimeout: TimeInterval = 30.0
 
-    // Last state known for a monitored region, from any source - crossings and determinations alike.
-    // Decides whether a determination is news; see report(_:state:fromCrossing:).
-    private var monitoredRegionStates: [String: CLRegionState] = [:]
-    // Last state actually announced to listeners. Kept apart from the above because a determination
-    // updates what is known without announcing anything, and must not consume the announcement a
-    // later crossing is entitled to make - see report(_:state:fromCrossing:).
-    private var reportedRegionStates: [String: CLRegionState] = [:]
-    private let initialStateRetryDelay: TimeInterval = 3.0
-
     private var authorizationCallbacks: [(String) -> Void] = []
     private var authorizationTarget: CLAuthorizationStatus?
     private let authorizationTimeout: TimeInterval = 60.0
+
+    /*
+      On iOS 18 an "always" grant is not enough on its own - a session must be held to use it.
+
+      From CLServiceSession.h: an app with Always authorization "which is not holding such a
+      CLServiceSession will not be able to receive CLLocationUpdate.liveUpdates() or
+      CLMonitor.events() when it is not in-use". So without this object, background monitoring - the
+      whole point of the plugin - silently delivers nothing.
+
+      It must be taken while in-use, or immediately at launch if one was held when the process last
+      ran; taken any other way it reports insufficientlyInUse and does nothing. Hence the durable
+      flag: it records that always-operation was configured in some earlier run, which is what makes
+      re-taking it during a background relaunch legitimate.
+    */
+    private var serviceSession: CLServiceSession?
+    private var sessionDiagnosticsTask: Task<Void, Never>?
+    private static let alwaysConfiguredKey = "CapacitorIbeacon.alwaysOperationConfigured"
+
+    // MARK: - Ranging state
+
+    /*
+      Ranging stays on CLLocationManager, because there is nowhere else for it to go.
+
+      startRangingBeacons(in:) is hard-deprecated in favour of startRangingBeacons(satisfying:), and
+      that takes a CLBeaconIdentityConstraint - a type itself marked deprecated toward
+      CLBeaconIdentityCondition, which has no ranging API at all. CLMonitor does not range. So the
+      constraint form is simultaneously the current one and the last one, and it emits no warning at
+      any deployment target.
+
+      The exact constraint used to start is kept, never rebuilt. stopRangingBeacons(satisfying:)
+      matches on the constraint, and a constraint rebuilt from a different subset of uuid/major/minor
+      is a different constraint that stops nothing - ranging would then run until the process died.
+    */
+    var rangingConstraints: [String: CLBeaconIdentityConstraint] = [:]
+    // Ranging asked for through the plugin API, and ranging this class turned on by itself. Kept
+    // apart so neither can cancel the other: an exit must not stop ranging a caller asked for, and
+    // a caller's stop must not cancel ranging that a region occupancy still justifies.
+    var explicitRanging: Set<String> = []
+    var automaticRanging: Set<String> = []
+    // Constraints currently ranging at the OS level, keyed by their canonical form, holding the very
+    // object passed to startRangingBeacons so that stop can pass the same one.
+    var activeRanging: [String: CLBeaconIdentityConstraint] = [:]
+
+    /*
+      Background ranging does not exist on iOS, so this does not pretend to provide it.
+
+      Ranging only produces measurements while the process is unsuspended, and Apple's position is
+      that ranging was never meant to work in the background at all unless some other capability is
+      keeping the app alive. Even that no longer holds: on iOS 18 the ranging callback keeps firing
+      with empty arrays once the display goes off, so the scan - not the process - is what stops.
+
+      What is available is the few seconds of runtime that a monitoring event itself buys. So a
+      crossing delivered to a backgrounded process ranges for that window and stops: it captures the
+      proximity of the beacon at the moment of the crossing, which is the most useful instant of the
+      whole visit, and costs nothing that was not already running. Sustained ranging happens only in
+      the foreground, where it genuinely works.
+    */
+    let backgroundBurstDuration: TimeInterval = 10.0
+    var burstTimers: [String: Timer] = [:]
+
+    /*
+      Restates what CLMonitor believes it is monitoring, and under what permissions.
+
+      Everything about monitoring is otherwise invisible until it speaks: a condition silently
+      dropped, an authorization downgraded while the app ran, and a condition being watched normally
+      all look identical from outside. Stated on a timer so the silence can be attributed.
+    */
+    private var monitoringAuditTimer: Timer?
+    private let monitoringAuditInterval: TimeInterval = 60
+    private var applicationObservers: [NSObjectProtocol] = []
+    private var protectedDataObserver: NSObjectProtocol?
 
     override public init() {
         super.init()
@@ -51,69 +153,23 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
         // peripheralManager intentionally not constructed here - see withReadyPeripheralManager().
     }
 
+    // MARK: - Lifecycle
+
     /*
-      Called from the host app's AppDelegate on every launch, background relaunches included, so that
-      a delegate is in place before Core Location delivers anything. Regions monitored before the app
-      was terminated are adopted from Core Location itself, which persists them - so monitoring
-      re-asserts on launch without the frontend having to ask, and keeps working even if the frontend
-      never loads.
+      Called from the host app's AppDelegate on every launch, background relaunches included.
 
-      Their state is left unknown on purpose. Nothing may be announced merely because the app started:
-      an event is reported when Core Location reports a crossing, and a determination only confirms a
-      state that was already known - see report(_:state:fromCrossing:).
+      Three things have to happen before Core Location delivers anything, and all of them are why
+      this cannot wait for a bridge:
+
+      - The service session is re-taken. Without it, an always-authorized app receives no monitor
+      events while not in-use.
+      - The monitor is opened by name and its events are drained. CLMonitor.h is explicit that
+      CoreLocation "will stop monitoring conditions if an event is pending for them, but no
+      CLMonitor has been configured to receive it" - so failing to open it here does not merely
+      miss one event, it ends monitoring altogether.
+      - Conditions are adopted from the monitor's own persisted records, so monitoring re-asserts
+      without the frontend having to ask, and keeps working even if the frontend never loads.
     */
-    /*
-      Restates what Core Location believes it is monitoring, and under what permissions.
-
-      Everything about monitoring is otherwise invisible until it speaks: a region silently dropped
-      from monitoredRegions, an authorization downgraded while the app ran, and a region being watched
-      normally all look identical from outside - nothing is logged, and no crossing arrives in any of
-      the three cases. Stated on a timer so the silence can be attributed.
-    */
-    private var monitoringAuditTimer: Timer?
-    private let monitoringAuditInterval: TimeInterval = 60
-
-    public func auditMonitoring(_ reason: String) {
-        let accuracy: String
-        if #available(iOS 14.0, *) {
-            accuracy = locationManager.accuracyAuthorization == .fullAccuracy ? "full" : "REDUCED"
-        } else {
-            accuracy = "full"
-        }
-
-        let watched = locationManager.monitoredRegions.compactMap { ($0 as? CLBeaconRegion)?.identifier }.sorted()
-        let available = CLLocationManager.isMonitoringAvailable(for: CLBeaconRegion.self)
-
-        beaconLog("CapacitorIbeacon: audit (%@) - authorization %@, accuracy %@, monitoring available %@, Core Location watching %d: %@",
-              reason,
-              getAuthorizationStatus(),
-              accuracy,
-              available ? "yes" : "NO",
-              watched.count,
-              watched.isEmpty ? "(none)" : watched.joined(separator: ", "))
-
-        // What this process thinks it registered, against what Core Location will admit to. A region
-        // that is in one and not the other is monitoring that will never report anything.
-        let ours = monitoredRegions.keys.sorted()
-        if ours != watched {
-            beaconLog("CapacitorIbeacon: audit (%@) - MISMATCH, this process expects %d: %@",
-                  reason, ours.count, ours.isEmpty ? "(none)" : ours.joined(separator: ", "))
-        }
-
-        /*
-          Asks Core Location what it currently thinks of each region.
-
-          Read-only - the answer arrives at didDetermineState, where an .outside determination is
-          logged and deliberately never turned into an exit. The point is to find out whether Core
-          Location still believes the device is inside a region it has stopped hearing: if it answers
-          .outside while never having sent didExitRegion, the crossing is being lost between the two,
-          and if it answers .inside the region genuinely never ended as far as the OS is concerned.
-        */
-        for region in monitoredRegions.values {
-            locationManager.requestState(for: region)
-        }
-    }
-
     public func start(diagnosticLogFile: Bool = false) {
         // Before the first line below, so that the launch state - the authorization and accuracy that
         // decide whether monitoring can report anything at all - is in the file rather than only in a
@@ -121,46 +177,110 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
         CapacitorIbeaconDiagnosticLog.isEnabled = diagnosticLogFile
 
         /*
-          iOS declines to monitor beacon regions on reduced accuracy, and says so nowhere - which
-          looks exactly like a beacon that is never heard. Worth stating at launch, since it is a
-          Settings toggle rather than anything the code can fix.
+          iOS declines to monitor beacons on reduced accuracy. On iOS 18 a monitor event says so
+          itself through accuracyLimited, but the launch state is worth stating outright, since it is
+          a Settings toggle rather than anything the code can fix.
         */
-        let accuracy: String
-        if #available(iOS 14.0, *) {
-            accuracy = locationManager.accuracyAuthorization == .fullAccuracy ? "full" : "REDUCED"
-        } else {
-            accuracy = "full"
-        }
         beaconLog("CapacitorIbeacon: authorization %@, accuracy %@, bluetooth-dependent monitoring",
-              getAuthorizationStatus(), accuracy)
+                  getAuthorizationStatus(), hasFullAccuracy() ? "full" : "REDUCED")
 
-        var adopted: [String] = []
-        for region in locationManager.monitoredRegions {
-            guard let beaconRegion = region as? CLBeaconRegion else { continue }
-            monitoredRegions[beaconRegion.identifier] = beaconRegion
-            adopted.append(beaconRegion.identifier)
-        }
-
-        // Also the marker for "is this build running the process-scoped monitoring?", which is
-        // otherwise unanswerable from outside: Swift method names are mangled away in a release
-        // binary, so only a string literal like this one survives to be grepped for in an .ipa.
-        beaconLog("CapacitorIbeacon: monitoring started for the process, adopted %d region(s): %@",
-              adopted.count, adopted.joined(separator: ", "))
-
-        // Adopted regions start with both maps empty by design, so the first event for each one is
-        // judged against nothing. Stated explicitly because that emptiness is what decides whether
-        // an event arriving moments from now is announced or swallowed.
-        if !adopted.isEmpty {
-            beaconLog("CapacitorIbeacon: adopted regions carry no remembered state into this process")
-        }
-
-        auditMonitoring("launch")
+        observeApplicationState()
+        retakeServiceSessionIfConfigured()
+        openMonitor()
 
         monitoringAuditTimer?.invalidate()
         monitoringAuditTimer = Timer.scheduledTimer(withTimeInterval: monitoringAuditInterval,
                                                     repeats: true) { [weak self] _ in
             self?.auditMonitoring("periodic")
         }
+    }
+
+    /*
+      Conditions live in a file in the app's data container, and CLMonitor.h says to wait for
+      protected data before opening one. A device that reboots and hears a beacon before the user has
+      unlocked it once would otherwise open a monitor that cannot read its own conditions - which
+      arrives as persistenceUnavailable, if it arrives at all.
+    */
+    private func openMonitor() {
+        guard monitorTask == nil else { return }
+
+        if !UIApplication.shared.isProtectedDataAvailable {
+            beaconLog("CapacitorIbeacon: protected data unavailable, deferring monitor until first unlock")
+            guard protectedDataObserver == nil else { return }
+            protectedDataObserver = NotificationCenter.default.addObserver(
+                forName: UIApplication.protectedDataDidBecomeAvailableNotification,
+                object: nil, queue: .main) { [weak self] _ in
+                beaconLog("CapacitorIbeacon: protected data available, opening monitor")
+                self?.openMonitor()
+            }
+            return
+        }
+
+        monitorTask = Task { [weak self] in
+            let monitor = await CLMonitor(CapacitorIbeacon.monitorName)
+
+            // Adopted before the drain begins: an event for a condition this process has not yet
+            // heard of would otherwise be judged against nothing and announced as news.
+            var adopted: [AdoptedCondition] = []
+            for identifier in await monitor.identifiers {
+                guard let record = await monitor.record(for: identifier),
+                      let condition = record.condition as? CLMonitor.BeaconIdentityCondition else { continue }
+                adopted.append(AdoptedCondition(identifier: identifier,
+                                                condition: condition,
+                                                inside: record.lastEvent.state == .satisfied))
+            }
+
+            DispatchQueue.main.async {
+                self?.monitor = monitor
+                self?.adopt(adopted)
+            }
+
+            /*
+              Drained for the life of the process. The sequence is the only delivery mechanism there
+              is, and an event that arrives while nobody is iterating is an event that stops
+              monitoring - so this loop is not allowed to end quietly.
+            */
+            do {
+                for try await event in await monitor.events {
+                    let snapshot = MonitorEventSnapshot(identifier: event.identifier,
+                                                        state: event.state,
+                                                        diagnostics: CapacitorIbeacon.describeDiagnostics(event))
+                    DispatchQueue.main.async { self?.handle(snapshot) }
+                }
+                beaconLog("CapacitorIbeacon: monitor event stream ENDED - monitoring is no longer being received")
+            } catch {
+                beaconLog("CapacitorIbeacon: monitor event stream FAILED: %@", error.localizedDescription)
+            }
+        }
+    }
+
+    private func adopt(_ adopted: [AdoptedCondition]) {
+        for entry in adopted {
+            let identifier = entry.identifier
+            conditions[identifier] = entry.condition
+            rangingConstraints[identifier] = CapacitorIbeacon.constraint(from: entry.condition)
+            /*
+              The persisted state is adopted as already announced, which is what keeps a relaunch
+              quiet. Before CLMonitor this state died with the process, so a region entered long ago
+              had to be left deliberately unknown to stop it being re-announced on every launch;
+              now the framework remembers, and a repeat of a state already reported is recognisably
+              a repeat rather than merely unjudgeable.
+            */
+            announcedInside[identifier] = entry.inside
+        }
+
+        let names = adopted.map { "\($0.identifier)\($0.inside ? " (inside)" : "")" }.sorted()
+
+        // Also the marker for "is this build running the process-scoped monitoring?", which is
+        // otherwise unanswerable from outside: Swift method names are mangled away in a release
+        // binary, so only a string literal like this one survives to be grepped for in an .ipa.
+        beaconLog("CapacitorIbeacon: monitoring started for the process, adopted %d condition(s): %@",
+                  adopted.count, names.isEmpty ? "(none)" : names.joined(separator: ", "))
+
+        // A region adopted as occupied deserves ranging as much as one just entered, and after a
+        // foreground relaunch this is the only place that occupancy is learned.
+        refreshAutomaticRanging()
+        auditMonitoring("launch")
     }
 
     // The bridge that is currently alive, or nil while none is - JS events are routed through it and
@@ -171,6 +291,299 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
 
     public func isCurrentPlugin(_ candidate: CapacitorIbeaconPlugin) -> Bool {
         return plugin === candidate
+    }
+
+    // MARK: - Monitor events
+
+    // Named rather than a tuple: three values travel together from the monitor's records into
+    // adopt(), and "the Bool" is not a readable way to say whether a region is occupied.
+    private struct AdoptedCondition {
+        let identifier: String
+        let condition: CLMonitor.BeaconIdentityCondition
+        let inside: Bool
+    }
+
+    private struct MonitorEventSnapshot {
+        let identifier: String
+        let state: CLMonitor.Event.State
+        let diagnostics: [String]
+    }
+
+    /*
+      Every reason iOS 18 gives for an event, in the order that matters for reading a log.
+
+      These are the whole argument for the migration. Each one names a way monitoring goes silent
+      that previously had to be guessed at from an audit timer and a log line - and, critically, each
+      one distinguishes "the beacon is not here" from "I cannot tell you whether the beacon is here".
+    */
+    private static func describeDiagnostics(_ event: CLMonitor.Event) -> [String] {
+        var reasons: [String] = []
+        if event.accuracyLimited { reasons.append("accuracy limited (Precise Location is off)") }
+        if event.authorizationDenied { reasons.append("authorization denied") }
+        if event.authorizationDeniedGlobally { reasons.append("Location Services disabled system-wide") }
+        if event.authorizationRestricted { reasons.append("authorization restricted") }
+        if event.insufficientlyInUse { reasons.append("app not sufficiently in-use") }
+        if event.serviceSessionRequired { reasons.append("no service session held") }
+        if event.persistenceUnavailable { reasons.append("condition persistence unavailable") }
+        if event.conditionUnsupported { reasons.append("condition unsupported") }
+        if event.conditionLimitExceeded { reasons.append("condition limit exceeded") }
+        if event.authorizationRequestInProgress { reasons.append("authorization request in progress") }
+        return reasons
+    }
+
+    /*
+      Turns a monitor event into an enter, an exit, or deliberate silence.
+
+      The rule is asymmetric, and the asymmetry is the point. A satisfied event is positive evidence
+      that the beacon is present, and is announced whatever else the event says about the state of
+      the app's permissions. An unsatisfied event is not evidence of absence: it is also what iOS
+      sends when it has been prevented from telling - accuracy limited, authorization revoked,
+      condition unsupported, no session held. Announcing those as exits would mean that turning off
+      Precise Location, or a session lapsing, reads to the consuming app exactly like the user
+      walking out of the building.
+
+      Before iOS 18 this distinction was not available at all, which is why the old code refused to
+      trust anything except a crossing and let a stay run forever rather than risk a false exit.
+    */
+    private func handle(_ event: MonitorEventSnapshot) {
+        let identifier = event.identifier
+        let reasons = event.diagnostics.joined(separator: ", ")
+        let wasInside = announcedInside[identifier] ?? false
+
+        let stateName: String
+        switch event.state {
+        case .satisfied: stateName = "satisfied"
+        case .unsatisfied: stateName = "unsatisfied"
+        case .unknown: stateName = "unknown"
+        case .unmonitored: stateName = "unmonitored"
+        @unknown default: stateName = "?"
+        }
+
+        beaconLog("CapacitorIbeacon: << monitor %@ %@%@, app %@ (announced %@)",
+                  identifier,
+                  stateName,
+                  event.diagnostics.isEmpty ? "" : " [\(reasons)]",
+                  CapacitorIbeacon.applicationStateName(),
+                  wasInside ? "inside" : "outside")
+
+        // A blocked event is a monitoring failure with a stated cause, which is exactly what this
+        // event has always meant to a consuming app - it just never had a reason to carry.
+        if !event.diagnostics.isEmpty {
+            plugin?.notifyListeners("monitoringDidFailForRegion", data: [
+                "region": regionPayload(identifier),
+                "error": reasons
+            ])
+        }
+
+        switch event.state {
+        case .satisfied:
+            guard !wasInside else {
+                beaconLog("CapacitorIbeacon: %@ enter suppressed, already announced inside", identifier)
+                return
+            }
+            announcedInside[identifier] = true
+            announce("didEnterRegion", identifier: identifier, state: "enter")
+            beginRanging(for: identifier)
+
+        case .unsatisfied:
+            /*
+              Only a clean unsatisfied ends a stay. With any diagnostic set, the state is the
+              framework reporting that it cannot see, and the stay is left standing: a region wrongly
+              held open recovers on the next real event, while a wrongly announced exit is a
+              notification the user has already read.
+            */
+            guard event.diagnostics.isEmpty else {
+                beaconLog("CapacitorIbeacon: %@ exit SUPPRESSED, unsatisfied only because: %@", identifier, reasons)
+                return
+            }
+            guard wasInside else {
+                beaconLog("CapacitorIbeacon: %@ exit suppressed, no announced stay to end", identifier)
+                return
+            }
+            announcedInside[identifier] = false
+            announce("didExitRegion", identifier: identifier, state: "exit")
+            endRanging(for: identifier)
+
+        case .unknown:
+            // Nothing determined yet - typically nothing has been scanned for. Left alone so that a
+            // later definite answer is still news.
+            break
+
+        case .unmonitored:
+            // The framework saying it has stopped watching this condition. Nothing here can restore
+            // it, but silence from now on has a cause, and this is the only place it is stated.
+            beaconLog("CapacitorIbeacon: %@ is NO LONGER MONITORED - no further events will arrive for it",
+                      identifier)
+            endRanging(for: identifier)
+
+        @unknown default:
+            break
+        }
+    }
+
+    // The constraint is the fallback, not an afterthought: an identifier can be ranged without ever
+    // being monitored, and the payload has always carried a uuid.
+    func regionPayload(_ identifier: String) -> [String: Any] {
+        var payload: [String: Any] = ["identifier": identifier]
+        if let uuid = conditions[identifier]?.uuid ?? rangingConstraints[identifier]?.uuid {
+            payload["uuid"] = uuid.uuidString
+        }
+        return payload
+    }
+
+    private func announce(_ event: String, identifier: String, state: String) {
+        beaconLog("CapacitorIbeacon: %@ %@ announced", identifier, state == "enter" ? "ENTER" : "EXIT")
+
+        let payload = regionPayload(identifier)
+        plugin?.notifyListeners(event, data: ["region": payload])
+        plugin?.notifyListeners("didDetermineStateForRegion", data: [
+            "region": payload,
+            "state": state
+        ])
+        broadcast(event, identifier: identifier)
+    }
+
+    // MARK: - Monitoring API
+
+    public func startMonitoringForRegion(identifier: String, uuid: String, major: Int?, minor: Int?, completion: @escaping (Result<Void, Error>) -> Void) {
+        guard let beaconUUID = UUID(uuidString: uuid) else {
+            completion(.failure(NSError(domain: "CapacitorIbeacon", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid UUID"])))
+            return
+        }
+
+        let condition = CapacitorIbeacon.condition(beaconUUID, major, minor)
+        conditions[identifier] = condition
+        rangingConstraints[identifier] = CapacitorIbeacon.constraint(beaconUUID, major, minor)
+
+        Task { [weak self] in
+            guard let monitor = await self?.awaitMonitor() else {
+                DispatchQueue.main.async {
+                    completion(.failure(NSError(domain: "CapacitorIbeacon", code: -3,
+                                                userInfo: [NSLocalizedDescriptionKey: "Monitoring is unavailable"])))
+                }
+                return
+            }
+
+            let existing = await monitor.record(for: identifier)?.condition as? CLMonitor.BeaconIdentityCondition
+            let unchanged = existing.map { CapacitorIbeacon.same($0, condition) } ?? false
+
+            /*
+              Re-registering an unchanged condition is a no-op, and deliberately so.
+
+              Conditions persist across launches while a frontend re-asserts its monitoring on every
+              app start, so most calls here describe something already being watched. Adding it again
+              would reset the state CLMonitor has been tracking, discarding a stay in progress - which
+              is how this once presented as "exits never fire": the reset made every arrival a fresh
+              entry, so enters kept working while the pending exit was destroyed each time.
+            */
+            if unchanged {
+                beaconLog("CapacitorIbeacon: startMonitoring %@ - already monitored, state left alone", identifier)
+            } else {
+                if existing != nil {
+                    // Same name, different beacon: a different condition wearing a used identifier
+                    // has to replace what is being watched rather than sit beside it.
+                    beaconLog("CapacitorIbeacon: startMonitoring %@ - replacing a condition of the same identifier",
+                              identifier)
+                    await monitor.remove(identifier)
+                }
+
+                /*
+                  Seeded as unsatisfied, so that a region the user is already standing in reports
+                  itself. Monitoring speaks on change, and assuming the opposite of what is likely
+                  true is what turns the first observation into an event - the same reason the old
+                  code seeded a state and then asked for it outright, minus the asking.
+                */
+                await monitor.add(condition, identifier: identifier, assuming: .unsatisfied)
+                DispatchQueue.main.async { self?.announcedInside[identifier] = false }
+                beaconLog("CapacitorIbeacon: startMonitoring %@ - NEW, assumed outside", identifier)
+            }
+
+            DispatchQueue.main.async {
+                completion(.success(()))
+                self?.auditMonitoring("after registering \(identifier)")
+            }
+        }
+    }
+
+    /*
+      Retires the identifier altogether, ranging included.
+
+      Ranging is reconciled after the constraint is forgotten, not before: the reconcile decides what
+      should be ranging from the identifiers that remain, so dropping the constraint first is what
+      makes the OS-level ranging disappear from the desired set and be stopped. Done the other way
+      round, an identifier that was also being ranged explicitly kept ranging with nothing left able
+      to name it, until some unrelated call reconciled again.
+    */
+    public func stopMonitoringForRegion(identifier: String, uuid: String) {
+        explicitRanging.remove(identifier)
+        automaticRanging.remove(identifier)
+        burstTimers[identifier]?.invalidate()
+        burstTimers.removeValue(forKey: identifier)
+        conditions.removeValue(forKey: identifier)
+        announcedInside.removeValue(forKey: identifier)
+        rangingConstraints.removeValue(forKey: identifier)
+        reconcileRanging()
+
+        Task { [weak self] in
+            guard let monitor = await self?.awaitMonitor() else { return }
+            await monitor.remove(identifier)
+            beaconLog("CapacitorIbeacon: stopMonitoring %@", identifier)
+        }
+    }
+
+    // The monitor is opened asynchronously and every API call may land before it exists. Waiting is
+    // correct rather than failing: the call was made against a plugin that is starting up, not
+    // against one that has no monitoring.
+    private func awaitMonitor() async -> CLMonitor? {
+        // Read on the main queue like every other piece of state here, rather than touched directly
+        // from this Task - see the note on @unchecked Sendable above.
+        for attempt in 0...50 {
+            if let monitor = await currentMonitor() { return monitor }
+            if attempt < 50 { try? await Task.sleep(nanoseconds: 100_000_000) }
+        }
+        beaconLog("CapacitorIbeacon: monitor still unavailable after waiting - is start() called from the AppDelegate?")
+        return nil
+    }
+
+    private func currentMonitor() async -> CLMonitor? {
+        return await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume(returning: self.monitor) }
+        }
+    }
+
+    // MARK: - Advertising
+
+    public func startAdvertising(uuid: String, major: Int, minor: Int, identifier: String, measuredPower: Int?, completion: @escaping (Result<Void, Error>) -> Void) {
+        guard let beaconUUID = UUID(uuidString: uuid) else {
+            completion(.failure(NSError(domain: "CapacitorIbeacon", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid UUID"])))
+            return
+        }
+
+        // The one remaining use of CLBeaconRegion: peripheralData(withMeasuredPower:) builds the
+        // advertisement payload, and nothing in the condition APIs replaces it.
+        let beaconRegion = CLBeaconRegion(uuid: beaconUUID, major: CLBeaconMajorValue(major), minor: CLBeaconMinorValue(minor), identifier: identifier)
+
+        withReadyPeripheralManager { manager in
+            guard manager.state == .poweredOn else {
+                let error = NSError(domain: "CapacitorIbeacon", code: -2, userInfo: [NSLocalizedDescriptionKey: "Bluetooth is not powered on"])
+                completion(.failure(error))
+                return
+            }
+
+            if let power = measuredPower {
+                manager.startAdvertising(beaconRegion.peripheralData(withMeasuredPower: NSNumber(value: power)) as? [String: Any])
+            } else {
+                manager.startAdvertising(beaconRegion.peripheralData(withMeasuredPower: nil) as? [String: Any])
+            }
+
+            completion(.success(()))
+        }
+    }
+
+    public func stopAdvertising() {
+        // Not withReadyPeripheralManager(): stopping something that was never started shouldn't
+        // newly construct (and trigger a permission prompt for) a manager that doesn't exist yet.
+        peripheralManager?.stopAdvertising()
     }
 
     // Merely instantiating CBPeripheralManager triggers the Bluetooth permission prompt, so
@@ -197,197 +610,7 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
         }
     }
 
-    public func startMonitoringForRegion(identifier: String, uuid: String, major: Int?, minor: Int?, completion: @escaping (Result<Void, Error>) -> Void) {
-        guard let beaconUUID = UUID(uuidString: uuid) else {
-            completion(.failure(NSError(domain: "CapacitorIbeacon", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid UUID"])))
-            return
-        }
-
-        let beaconRegion: CLBeaconRegion
-        if let major = major {
-            if let minor = minor {
-                beaconRegion = CLBeaconRegion(uuid: beaconUUID, major: CLBeaconMajorValue(major), minor: CLBeaconMinorValue(minor), identifier: identifier)
-            } else {
-                beaconRegion = CLBeaconRegion(uuid: beaconUUID, major: CLBeaconMajorValue(major), identifier: identifier)
-            }
-        } else {
-            beaconRegion = CLBeaconRegion(uuid: beaconUUID, identifier: identifier)
-        }
-
-        beaconRegion.notifyEntryStateOnDisplay = true
-        beaconRegion.notifyOnEntry = true
-        beaconRegion.notifyOnExit = true
-
-        /*
-          Whether this region is new to us decides whether its current state is worth asking for.
-
-          Core Location keeps monitoring across launches, and a frontend re-asserts its monitoring on
-          every app start, so most calls here re-register something already being watched. Asking for
-          the state then would report being inside a region that was entered long ago - an event that
-          says nothing except that the app started, and one that arrives again on every launch.
-
-          A region already in Core Location's own monitoredRegions counts as known even if this
-          process has never seen it, which is what makes a relaunch silent. Same identifier but
-          different identifiers means a different region, and it is new again.
-        */
-        let alreadyMonitored = locationManager.monitoredRegions.contains { existing in
-            guard let existing = existing as? CLBeaconRegion else { return false }
-            return existing.identifier == identifier && existing == beaconRegion
-        }
-
-        /*
-          A region carrying this identifier but different constraints is a different region wearing a
-          used name, and it has to replace what is being monitored rather than sit alongside it -
-          Core Location keys its persisted regions by identifier, so the stale one would otherwise be
-          watched forever with nothing able to stop it.
-        */
-        let staleSameIdentifier = locationManager.monitoredRegions.first { existing in
-            guard let existing = existing as? CLBeaconRegion else { return false }
-            return existing.identifier == identifier && existing != beaconRegion
-        }
-        if let stale = staleSameIdentifier {
-            beaconLog("CapacitorIbeacon: startMonitoring %@ - replacing a region of the same identifier with different constraints",
-                  identifier)
-            locationManager.stopMonitoring(for: stale)
-        }
-
-        // Which branch this takes decides whether monitoring is restarted below, so it is stated.
-        let sameIdentifier = staleSameIdentifier != nil || alreadyMonitored
-        beaconLog("CapacitorIbeacon: startMonitoring %@ - %@ (identifier already monitored: %@)",
-              identifier,
-              alreadyMonitored ? "already monitored, state left alone" : "NEW, state seeded outside",
-              sameIdentifier ? "yes" : "no")
-
-        if !alreadyMonitored {
-            /*
-              Seeded as announced-outside, not merely known-outside.
-
-              A region the user has just picked may well be one they are already standing in, and Core
-              Location reports crossings only - so without this the region would stay silent until it
-              was left and re-entered. The requestState() below answers with a determination, and
-              report() announces an arrival for a determination exactly when it contradicts an
-              announced exit; seeding one here is what makes that first answer count as the enter.
-
-              Adopted regions are deliberately not seeded, which is what keeps a relaunch quiet: with
-              nothing announced, their determinations have nothing to contradict.
-            */
-            monitoredRegionStates[identifier] = .outside
-            reportedRegionStates[identifier] = .outside
-        }
-
-        monitoredRegions[identifier] = beaconRegion
-
-        /*
-          Only for a region not already being monitored.
-
-          startMonitoring() on a region Core Location is already watching restarts it: the stay it has
-          been tracking is discarded and the region goes back to state-unknown. Core Location does not
-          report leaving a region it no longer believes you are inside - it waits to see an entry
-          first - so a frontend re-asserting its monitoring on every launch, as this one does, silently
-          destroyed the pending exit each time. Enters still worked, because the reset makes the next
-          arrival a genuine entry, which is why this looked like "exits never fire" specifically.
-
-          Re-registering is therefore a no-op: Core Location persists monitoring across launches and
-          termination, so the region is already being watched and needs nothing from us.
-        */
-        if !alreadyMonitored {
-            locationManager.startMonitoring(for: beaconRegion)
-
-            /*
-              Core Location reports boundary crossings only, so a region selected while already inside
-              it would stay silent until it was left and re-entered. Android reports it as soon as the
-              beacon is heard, so the state is asked for outright - but only for a region that is
-              genuinely new, which is the one case where the answer is news rather than a restatement.
-
-              Asked twice, because a beacon region's state comes back .unknown until the OS has had a
-              chance to scan - the retry only fires while nothing definite has arrived.
-            */
-            locationManager.requestState(for: beaconRegion)
-            DispatchQueue.main.asyncAfter(deadline: .now() + initialStateRetryDelay) { [weak self] in
-                guard let self = self,
-                      let region = self.monitoredRegions[identifier],
-                      self.monitoredRegionStates[identifier] == nil else { return }
-                self.locationManager.requestState(for: region)
-            }
-        }
-
-        // Core Location updates monitoredRegions asynchronously, so the audit is deferred rather than
-        // read straight back - read immediately it still shows the pre-call set.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            self?.auditMonitoring("after registering \(identifier)")
-        }
-
-        completion(.success(()))
-    }
-
-    public func stopMonitoringForRegion(identifier: String, uuid: String) {
-        if let region = monitoredRegions[identifier] {
-            locationManager.stopMonitoring(for: region)
-            monitoredRegions.removeValue(forKey: identifier)
-            monitoredRegionStates.removeValue(forKey: identifier)
-            reportedRegionStates.removeValue(forKey: identifier)
-        }
-    }
-
-    public func startRangingBeaconsInRegion(identifier: String, uuid: String, major: Int?, minor: Int?, completion: @escaping (Result<Void, Error>) -> Void) {
-        guard let beaconUUID = UUID(uuidString: uuid) else {
-            completion(.failure(NSError(domain: "CapacitorIbeacon", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid UUID"])))
-            return
-        }
-
-        let beaconRegion: CLBeaconRegion
-        if let major = major {
-            if let minor = minor {
-                beaconRegion = CLBeaconRegion(uuid: beaconUUID, major: CLBeaconMajorValue(major), minor: CLBeaconMinorValue(minor), identifier: identifier)
-            } else {
-                beaconRegion = CLBeaconRegion(uuid: beaconUUID, major: CLBeaconMajorValue(major), identifier: identifier)
-            }
-        } else {
-            beaconRegion = CLBeaconRegion(uuid: beaconUUID, identifier: identifier)
-        }
-
-        rangedRegions[identifier] = beaconRegion
-        locationManager.startRangingBeacons(in: beaconRegion)
-        completion(.success(()))
-    }
-
-    public func stopRangingBeaconsInRegion(identifier: String, uuid: String) {
-        if let region = rangedRegions[identifier] {
-            locationManager.stopRangingBeacons(in: region)
-            rangedRegions.removeValue(forKey: identifier)
-        }
-    }
-
-    public func startAdvertising(uuid: String, major: Int, minor: Int, identifier: String, measuredPower: Int?, completion: @escaping (Result<Void, Error>) -> Void) {
-        guard let beaconUUID = UUID(uuidString: uuid) else {
-            completion(.failure(NSError(domain: "CapacitorIbeacon", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid UUID"])))
-            return
-        }
-
-        let beaconRegion = CLBeaconRegion(uuid: beaconUUID, major: CLBeaconMajorValue(major), minor: CLBeaconMinorValue(minor), identifier: identifier)
-
-        withReadyPeripheralManager { manager in
-            guard manager.state == .poweredOn else {
-                let error = NSError(domain: "CapacitorIbeacon", code: -2, userInfo: [NSLocalizedDescriptionKey: "Bluetooth is not powered on"])
-                completion(.failure(error))
-                return
-            }
-
-            if let power = measuredPower {
-                manager.startAdvertising(beaconRegion.peripheralData(withMeasuredPower: NSNumber(value: power)) as? [String: Any])
-            } else {
-                manager.startAdvertising(beaconRegion.peripheralData(withMeasuredPower: nil) as? [String: Any])
-            }
-
-            completion(.success(()))
-        }
-    }
-
-    public func stopAdvertising() {
-        // Not ensurePeripheralManager(): stopping something that was never started shouldn't
-        // newly construct (and trigger a permission prompt for) a manager that doesn't exist yet.
-        peripheralManager?.stopAdvertising()
-    }
+    // MARK: - Authorization
 
     /*
       Both of these prompt the user, and the answer arrives on the authorization delegate rather than
@@ -406,9 +629,23 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
         }
     }
 
+    /*
+      Asking for "always" is taking the session, not calling requestAlwaysAuthorization().
+
+      A CLServiceSession with an always requirement makes Location Services seek that authorization,
+      and holding it is separately mandatory for receiving monitor events while not in-use - so the
+      request and the thing that makes the grant usable are the same object, and taking it here is
+      what marks always-operation as configured for later launches.
+
+      When-in-use is still requested first if nothing has been decided yet, because iOS escalates to
+      always from an existing grant rather than straight from undecided.
+    */
     public func requestAlwaysAuthorization(completion: @escaping (String) -> Void) {
         requestAuthorization(target: .authorizedAlways, completion: completion) {
-            self.locationManager.requestAlwaysAuthorization()
+            if self.currentAuthorizationStatus() == .notDetermined {
+                self.locationManager.requestWhenInUseAuthorization()
+            }
+            self.takeServiceSession(recordAsConfigured: true)
         }
     }
 
@@ -419,8 +656,12 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
     ) {
         let current = currentAuthorizationStatus()
 
-        // Already answered - asking again shows nothing and reports nothing.
+        // Already answered - asking again shows nothing and reports nothing. The session is still
+        // taken, since a granted "always" without one delivers no events in the background.
         if current != .notDetermined, current == target || target == .authorizedWhenInUse {
+            if target == .authorizedAlways {
+                takeServiceSession(recordAsConfigured: true)
+            }
             completion(getAuthorizationStatus())
             return
         }
@@ -436,26 +677,73 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
     }
 
     /*
-      iOS will not monitor an iBeacon region on reduced accuracy, and says so nowhere: no error, no
-      monitoringDidFail, just permanent silence that is indistinguishable from a beacon nobody can
-      hear. Ranging gives it away - every measurement comes back rssi 0, accuracy -1.
+      Re-taken at launch, and only if it was configured before.
 
-      So being granted "always" is not enough, and the accuracy is reported rather than fixed: it is
-      in the launch line, in every audit, and in getAuthorizationStatus() as
-      authorized_reduced_accuracy. Only Settings > the app > Location > Precise Location settles it.
+      CLServiceSession.h allows a session to be created while in-use, or "immediately when launched
+      in the background if a matching session was held when previously running" - and Apple's
+      guidance is blunter still about the when-in-use equivalent: such a session "cannot start in the
+      background". So the durable flag is not a convenience, it is the thing that makes this legal:
+      without evidence that always-operation was configured in an earlier run, taking a session here
+      would only earn insufficientlyInUse.
+    */
+    private func retakeServiceSessionIfConfigured() {
+        guard UserDefaults.standard.bool(forKey: CapacitorIbeacon.alwaysConfiguredKey) else {
+            beaconLog("CapacitorIbeacon: no always-operation on record, no service session taken")
+            return
+        }
+        takeServiceSession(recordAsConfigured: false)
+    }
 
-      Asking in-app was tried and removed. requestTemporaryFullAccuracyAuthorization grants accuracy
-      for the session, which is the one span this plugin does not need it for - monitoring outlives
-      the process, and the Core Location background relaunch that delivers a crossing has no
-      foreground to prompt in. It also needs NSLocationTemporaryUsageDescriptionDictionary in the
-      host app's Info.plist, so a host that had not been told to add the entry got a request iOS
-      silently ignored.
+    private func takeServiceSession(recordAsConfigured: Bool) {
+        if recordAsConfigured {
+            UserDefaults.standard.set(true, forKey: CapacitorIbeacon.alwaysConfiguredKey)
+        }
+
+        guard serviceSession == nil else { return }
+
+        let session = CLServiceSession(authorization: .always)
+        serviceSession = session
+        beaconLog("CapacitorIbeacon: service session taken (always)")
+
+        /*
+          The session reports its own suspension, and it is the only channel that does. A session
+          that lapses stops monitor events without stopping anything else, so these lines are the
+          difference between "the beacons went quiet" and "the session was suspended at 14:02".
+        */
+        sessionDiagnosticsTask?.cancel()
+        sessionDiagnosticsTask = Task {
+            do {
+                for try await diagnostic in session.diagnostics {
+                    var reasons: [String] = []
+                    if diagnostic.authorizationDenied { reasons.append("authorization denied") }
+                    if diagnostic.authorizationDeniedGlobally { reasons.append("Location Services disabled system-wide") }
+                    if diagnostic.authorizationRestricted { reasons.append("authorization restricted") }
+                    if diagnostic.insufficientlyInUse { reasons.append("app not sufficiently in-use") }
+                    if diagnostic.alwaysAuthorizationDenied { reasons.append("always authorization denied") }
+                    if diagnostic.fullAccuracyDenied { reasons.append("full accuracy denied") }
+                    if diagnostic.serviceSessionRequired { reasons.append("service session required") }
+                    if diagnostic.authorizationRequestInProgress { reasons.append("authorization request in progress") }
+
+                    beaconLog("CapacitorIbeacon: service session %@",
+                              reasons.isEmpty ? "active, no diagnostics" : "SUSPENDED: \(reasons.joined(separator: ", "))")
+                }
+            } catch {
+                beaconLog("CapacitorIbeacon: service session diagnostics failed: %@", error.localizedDescription)
+            }
+        }
+    }
+
+    /*
+      iOS will not monitor beacons on reduced accuracy, and before iOS 18 said so nowhere: no error,
+      no failure callback, just permanent silence indistinguishable from a beacon nobody can hear.
+
+      A monitor event now reports it itself, through accuracyLimited, which is what lets an
+      unsatisfied state be recognised as "cannot tell" rather than "not here". This remains for the
+      launch line and for getAuthorizationStatus(), which reports authorized_reduced_accuracy - only
+      Settings > the app > Location > Precise Location settles it.
     */
     public func hasFullAccuracy() -> Bool {
-        if #available(iOS 14.0, *) {
-            return locationManager.accuracyAuthorization == .fullAccuracy
-        }
-        return true
+        return locationManager.accuracyAuthorization == .fullAccuracy
     }
 
     private func settleAuthorization() {
@@ -470,10 +758,7 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
     }
 
     private func currentAuthorizationStatus() -> CLAuthorizationStatus {
-        if #available(iOS 14.0, *) {
-            return locationManager.authorizationStatus
-        }
-        return CLLocationManager.authorizationStatus()
+        return locationManager.authorizationStatus
     }
 
     public func getAuthorizationStatus() -> String {
@@ -504,60 +789,54 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
         return CLLocationManager.isRangingAvailable()
     }
 
-    // MARK: - CLLocationManagerDelegate
+    // MARK: - Audit
 
-    public func locationManager(_ manager: CLLocationManager, didRangeBeacons beacons: [CLBeacon], in region: CLBeaconRegion) {
-        var beaconsArray: [[String: Any]] = []
+    public func auditMonitoring(_ reason: String) {
+        let ranging = activeRanging.keys.sorted()
+        let expected = conditions.keys.sorted()
 
-        for beacon in beacons {
-            var proximityString = "unknown"
-            switch beacon.proximity {
-            case .immediate:
-                proximityString = "immediate"
-            case .near:
-                proximityString = "near"
-            case .far:
-                proximityString = "far"
-            case .unknown:
-                proximityString = "unknown"
-            @unknown default:
-                proximityString = "unknown"
+        beaconLog("CapacitorIbeacon: audit (%@) - authorization %@, accuracy %@, session %@, app %@, ranging %@",
+                  reason,
+                  getAuthorizationStatus(),
+                  hasFullAccuracy() ? "full" : "REDUCED",
+                  serviceSession == nil ? "NONE" : "held",
+                  CapacitorIbeacon.applicationStateName(),
+                  ranging.isEmpty ? "(none)" : ranging.joined(separator: ", "))
+
+        guard let monitor = monitor else {
+            beaconLog("CapacitorIbeacon: audit (%@) - NO MONITOR OPEN, nothing is being watched", reason)
+            return
+        }
+
+        Task {
+            var lines: [String] = []
+            for identifier in await monitor.identifiers {
+                guard let record = await monitor.record(for: identifier) else { continue }
+                let state: String
+                switch record.lastEvent.state {
+                case .satisfied: state = "inside"
+                case .unsatisfied: state = "outside"
+                case .unknown: state = "unknown"
+                case .unmonitored: state = "UNMONITORED"
+                @unknown default: state = "?"
+                }
+                lines.append("\(identifier) \(state)")
             }
 
-            beaconsArray.append([
-                "uuid": beacon.uuid.uuidString,
-                "major": beacon.major.intValue,
-                "minor": beacon.minor.intValue,
-                "rssi": beacon.rssi,
-                "proximity": proximityString,
-                "accuracy": beacon.accuracy
-            ])
-        }
+            beaconLog("CapacitorIbeacon: audit (%@) - CLMonitor watching %d: %@",
+                      reason, lines.count, lines.isEmpty ? "(none)" : lines.sorted().joined(separator: ", "))
 
-        plugin?.notifyListeners("didRangeBeacons", data: [
-            "region": [
-                "identifier": region.identifier,
-                "uuid": region.uuid.uuidString
-            ],
-            "beacons": beaconsArray
-        ])
-    }
-
-    public func locationManager(_ manager: CLLocationManager, didEnterRegion region: CLRegion) {
-        if let beaconRegion = region as? CLBeaconRegion {
-            beaconLog("CapacitorIbeacon: << didEnterRegion %@ (crossing), app %@",
-                  beaconRegion.identifier, CapacitorIbeacon.applicationStateName())
-            report(beaconRegion, state: .inside, fromCrossing: true)
+            // What this process thinks it registered, against what CLMonitor will admit to. A
+            // condition in one and not the other is monitoring that will never report anything.
+            let watched = await monitor.identifiers.sorted()
+            if expected != watched {
+                beaconLog("CapacitorIbeacon: audit (%@) - MISMATCH, this process expects %d: %@",
+                          reason, expected.count, expected.isEmpty ? "(none)" : expected.joined(separator: ", "))
+            }
         }
     }
 
-    public func locationManager(_ manager: CLLocationManager, didExitRegion region: CLRegion) {
-        if let beaconRegion = region as? CLBeaconRegion {
-            beaconLog("CapacitorIbeacon: << didExitRegion %@ (crossing), app %@",
-                  beaconRegion.identifier, CapacitorIbeacon.applicationStateName())
-            report(beaconRegion, state: .outside, fromCrossing: true)
-        }
-    }
+    // MARK: - CLLocationManagerDelegate
 
     public func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
         let status = currentAuthorizationStatus()
@@ -578,165 +857,35 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
         settleAuthorization()
     }
 
-    // Answers requestState(), and iOS also volunteers this on its own - notifyEntryStateOnDisplay
-    // makes every screen-on while inside a region deliver one.
-    public func locationManager(_ manager: CLLocationManager, didDetermineState state: CLRegionState, for region: CLRegion) {
-        guard let beaconRegion = region as? CLBeaconRegion else { return }
-
-        switch state {
-        case .inside, .outside:
-            beaconLog("CapacitorIbeacon: << didDetermineState %@ %@ (determination), app %@",
-                  beaconRegion.identifier,
-                  state == .inside ? "inside" : "outside",
-                  CapacitorIbeacon.applicationStateName())
-            report(beaconRegion, state: state, fromCrossing: false)
-        case .unknown:
-            // Nothing determined yet - typically no beacon has been scanned for. Left unrecorded so
-            // that the retry in startMonitoringForRegion() still asks again.
-            beaconLog("CapacitorIbeacon: << didDetermineState %@ unknown (determination), app %@",
-                  beaconRegion.identifier, CapacitorIbeacon.applicationStateName())
-            break
-        @unknown default:
-            break
-        }
-    }
+    // MARK: - Application state
 
     /*
-      Announces region events, and decides which of the things iOS delivers deserve announcing.
+      Foreground and background are load-bearing here, not incidental.
 
-      Android is the reference: AltBeacon reports only genuine transitions, so its plugin passes
-      didEnterRegion and didExitRegion straight to listeners and keeps no state at all. iOS needs a
-      little more only because it delivers a second, noisier kind of event - didDetermineState, which
-      notifyEntryStateOnDisplay produces on every screen-on and which iOS also volunteers after a
-      launch. Announcing those unfiltered would mean an enter, and a push notification, every time the
-      user looked at their phone near a beacon.
-
-      So the rule is split by source rather than by state:
-
-      - A crossing (didEnterRegion / didExitRegion) is announced unconditionally, as on Android. Core
-        Location already delays these to ride out flapping, so second-guessing them here only loses
-        real events - which is exactly what two successive attempts at deduplicating them did.
-      - A determination is announced only to report an arrival that contradicts an exit that was
-        actually announced, and never to report a departure - an .outside determination is an
-        instantaneous sample taken at a moment the beacon happened not to be heard, which is the very
-        flapping Core Location's exit delay exists to absorb.
-
-      Two states are tracked to keep those apart. `monitoredRegionStates` is what is known, from any
-      source; `reportedRegionStates` is what was actually announced. Decisions read the latter, because
-      determinations write the former themselves - and a rule that tests what determinations wrote lets
-      one determination validate the next, which is how a relaunch manufactured a spurious enter.
+      Sustained ranging exists only in the foreground, and the burst exists only in the background,
+      so the transition between them is what promotes one to the other - a region entered on the
+      street keeps ranging when the user takes the phone out, and stops when they put it away.
     */
-    private func report(_ region: CLBeaconRegion, state: CLRegionState, fromCrossing: Bool) {
-        let previous = monitoredRegionStates[region.identifier]
-        monitoredRegionStates[region.identifier] = state
+    private func observeApplicationState() {
+        guard applicationObservers.isEmpty else { return }
 
-        let regionPayload: [String: Any] = [
-            "identifier": region.identifier,
-            "uuid": region.uuid.uuidString
-        ]
-
-        let announced = reportedRegionStates[region.identifier]
-
-        // Every decision this method makes, with the inputs it made it from: which of the two maps
-        // held what, and whether the event was a crossing. Silence here is the thing that needed
-        // explaining - an event that arrives and is deliberately not announced looks, from outside,
-        // exactly like an event that never arrived at all.
-        func describe(_ value: CLRegionState?) -> String {
-            switch value {
-            case .some(.inside): return "inside"
-            case .some(.outside): return "outside"
-            case .some(.unknown): return "unknown"
-            case .none: return "nil"
-            @unknown default: return "?"
-            }
-        }
-
-        let outcome: String
-        if fromCrossing {
-            // A crossing is Core Location's considered verdict, arrived at after the delays it
-            // applies to ride out flapping - the same thing AltBeacon reports on Android, where it
-            // is passed to listeners unconditionally. It is announced as it arrives, with no state
-            // consulted: every suppression tried here so far has cost a real crossing.
-            outcome = state == .inside ? "ENTER announced" : "EXIT announced"
-            reportedRegionStates[region.identifier] = state
-            let event = state == .inside ? "didEnterRegion" : "didExitRegion"
-            plugin?.notifyListeners(event, data: ["region": regionPayload])
-            broadcast(event, region)
-        } else if state == .inside, announced == .outside {
-            /*
-              A determination is the only thing that needs filtering, and only in one direction.
-
-              notifyEntryStateOnDisplay delivers one on every screen-on, and iOS volunteers one after
-              a launch, so announcing each would mean an enter - and a push notification - every time
-              the user glanced at the phone. It is news only when it contradicts a departure that was
-              actually announced: the region was reported left, and is now demonstrably occupied.
-
-              Judged against what was announced, never against what is merely known. Determinations
-              seed the known state themselves, so testing against that would let one determination
-              validate the next, which is how a relaunch used to manufacture an enter.
-            */
-            outcome = "ENTER announced (determination contradicts an announced exit)"
-            reportedRegionStates[region.identifier] = state
-            plugin?.notifyListeners("didEnterRegion", data: ["region": regionPayload])
-            broadcast("didEnterRegion", region)
-        } else if state == .inside {
-            outcome = announced == .inside
-                ? "enter suppressed, already announced inside"
-                : "enter suppressed, determination with no announced exit to contradict"
-        } else {
-            // Never an exit. A determination of .outside is an instantaneous sample - a screen-on at
-            // a moment the beacon was not heard - while Core Location delays a real exit precisely to
-            // ride that out. Only didExitRegion above ends a stay.
-            outcome = "exit suppressed, determination is not a crossing"
-        }
-
-        beaconLog("CapacitorIbeacon: %@ %@ [%@, known %@, announced %@] -> %@",
-              region.identifier,
-              state == .inside ? "inside" : "outside",
-              fromCrossing ? "crossing" : "determination",
-              describe(previous),
-              describe(announced),
-              outcome)
-
-        guard previous != state else { return }
-
-        plugin?.notifyListeners("didDetermineStateForRegion", data: [
-            "region": regionPayload,
-            "state": state == .inside ? "enter" : "exit"
-        ])
+        let center = NotificationCenter.default
+        applicationObservers.append(
+            center.addObserver(forName: UIApplication.didBecomeActiveNotification,
+                               object: nil, queue: .main) { [weak self] _ in
+                self?.refreshAutomaticRanging()
+            })
+        applicationObservers.append(
+            center.addObserver(forName: UIApplication.didEnterBackgroundNotification,
+                               object: nil, queue: .main) { [weak self] _ in
+                self?.refreshAutomaticRanging()
+            })
     }
-
-    public func locationManager(_ manager: CLLocationManager, monitoringDidFailFor region: CLRegion?, withError error: Error) {
-        // Logged unconditionally: this is how Core Location says it declined to monitor, and it was
-        // previously only reported to a JS listener that may well not exist yet.
-        beaconLog("CapacitorIbeacon: monitoring FAILED for %@: %@",
-              (region as? CLBeaconRegion)?.identifier ?? "unknown region", error.localizedDescription)
-
-        if let beaconRegion = region as? CLBeaconRegion {
-            plugin?.notifyListeners("monitoringDidFailForRegion", data: [
-                "region": [
-                    "identifier": beaconRegion.identifier,
-                    "uuid": beaconRegion.uuid.uuidString
-                ],
-                "error": error.localizedDescription
-            ])
-        }
-    }
-
-    /*
-      Region events also go out on NotificationCenter, so that native code in the host app can act on
-      them without owning the CLLocationManager this class owns - the counterpart of adding a second
-      MonitorNotifier to the application-wide BeaconManager on Android.
-
-      Deliberately a plain string rather than a shared symbol: an observer needs no import, and the
-      contract is just this name plus the userInfo keys below.
-    */
-    public static let regionEventNotification = Notification.Name("CapacitorIbeaconRegionEvent")
 
     // Whether the UI was up when an event landed. A crossing delivered to a backgrounded or
     // freshly-relaunched process is the case that is hard to observe any other way, and the one
     // where events have been going missing.
-    private static func applicationStateName() -> String {
+    static func applicationStateName() -> String {
         var name = "unknown"
         let read = {
             switch UIApplication.shared.applicationState {
@@ -754,16 +903,27 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
         return name
     }
 
-    private func broadcast(_ event: String, _ region: CLBeaconRegion) {
-        NotificationCenter.default.post(
-            name: CapacitorIbeacon.regionEventNotification,
-            object: nil,
-            userInfo: [
-                "event": event,
-                "identifier": region.identifier,
-                "uuid": region.uuid.uuidString
-            ]
-        )
+    static func isForeground() -> Bool {
+        return applicationStateName() == "foreground"
+    }
+
+    // MARK: - Native broadcast
+
+    /*
+      Region events also go out on NotificationCenter, so that native code in the host app can act on
+      them without owning the monitoring this class owns - the counterpart of adding a second
+      MonitorNotifier to the application-wide BeaconManager on Android.
+
+      Deliberately a plain string rather than a shared symbol: an observer needs no import, and the
+      contract is just this name plus the userInfo keys below.
+    */
+    public static let regionEventNotification = Notification.Name("CapacitorIbeaconRegionEvent")
+
+    private func broadcast(_ event: String, identifier: String) {
+        var userInfo: [String: Any] = regionPayload(identifier)
+        userInfo["event"] = event
+        NotificationCenter.default.post(name: CapacitorIbeacon.regionEventNotification,
+                                        object: nil, userInfo: userInfo)
     }
 
     // MARK: - CBPeripheralManagerDelegate

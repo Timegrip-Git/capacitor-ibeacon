@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "CapgoCapacitorIbeacon",
-    platforms: [.iOS(.v15)],
+    platforms: [.iOS("18.0")],
     products: [
         .library(
             name: "CapgoCapacitorIbeacon",

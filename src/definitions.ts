@@ -43,6 +43,12 @@ export interface CapacitorIbeaconPlugin extends Plugin {
   /**
    * Start ranging beacons in a region. Provides continuous distance updates.
    *
+   * iOS: ranging only produces measurements while the app process is running, and iOS suspends it
+   * shortly after it leaves the foreground - background ranging is not supported by the platform.
+   * Entering a monitored region already starts ranging automatically while the app is in the
+   * foreground, and a background crossing gets a short burst instead. This call is tracked
+   * separately from that automatic behaviour, so a region exit never cancels ranging you asked for.
+   *
    * @param options - Region to range beacons in
    * @returns Promise that resolves when ranging starts
    * @throws Error if ranging fails to start
@@ -124,6 +130,11 @@ export interface CapacitorIbeaconPlugin extends Plugin {
 
   /**
    * Request "Always" location authorization (required for background monitoring).
+   *
+   * iOS 18+: this also takes the CLServiceSession that iOS requires in order to use an "always"
+   * grant - an app holding the grant but no session receives no monitoring events while it is not
+   * in-use. Call it once from the foreground when the user opts into background monitoring; the
+   * plugin re-takes the session on every later launch, background relaunches included.
    *
    * @returns Promise that resolves with authorization status
    * @throws Error if request fails

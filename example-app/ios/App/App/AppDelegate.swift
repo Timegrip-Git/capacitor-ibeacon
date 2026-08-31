@@ -1,5 +1,6 @@
 import UIKit
 import Capacitor
+import CapgoCapacitorIbeacon
 
 @UIApplicationMain
 class AppDelegate: UIResponder, UIApplicationDelegate {
@@ -7,7 +8,15 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     var window: UIWindow?
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
-        // Override point for customization after application launch.
+        /*
+          Required, and required here rather than anywhere the bridge can reach.
+
+          iOS relaunches a terminated app in the background to deliver a beacon crossing - within
+          moments, and long before a WebView and a frontend could be ready - and CLMonitor stops
+          monitoring a condition outright when an event is pending for it and no monitor has been
+          opened to receive it. Starting here is what makes monitoring survive termination.
+        */
+        CapacitorIbeacon.shared.start()
         return true
     }
 
