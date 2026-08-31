@@ -173,6 +173,12 @@ export interface CapacitorIbeaconPlugin extends Plugin {
   /**
    * Check if Bluetooth is enabled on the device.
    *
+   * iOS: reports whether *this app* can currently use Bluetooth, and never prompts. iOS exposes no
+   * way to read the radio without first holding Bluetooth permission, and beacon monitoring does not
+   * need that permission at all - so this resolves to `false` until something has asked for it, which
+   * only `startAdvertising` does. Do not gate monitoring or ranging on it; `getAuthorizationStatus`
+   * reports the permission those actually depend on.
+   *
    * @returns Promise that resolves with Bluetooth state
    * @throws Error if checking state fails
    * @since 1.0.0

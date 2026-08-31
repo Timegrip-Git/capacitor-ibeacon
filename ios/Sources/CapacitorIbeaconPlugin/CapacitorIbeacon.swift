@@ -452,8 +452,36 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
         }
 
         let condition = CapacitorIbeacon.condition(beaconUUID, major, minor)
+        let constraint = CapacitorIbeacon.constraint(beaconUUID, major, minor)
+
+        /*
+          An identifier repointed at a different beacon has to let go of the old one here.
+
+          Ranging is reconciled from the constraints these identifiers currently name, so replacing
+          this one silently removes the old constraint from everything that could ask for it - while
+          the OS is still ranging it, and activeRanging still holds it under its own key. Nothing
+          would notice until some unrelated call reconciled again, and until then the plugin ranges a
+          beacon no caller has named since.
+
+          The occupancy goes with it. automaticRanging exists because a region was entered, and the
+          region that was entered was the old beacon's - the Task below reaches the same conclusion
+          about announcedInside when it finds the condition changed.
+        */
+        let previous = rangingConstraints[identifier]
         conditions[identifier] = condition
-        rangingConstraints[identifier] = CapacitorIbeacon.constraint(beaconUUID, major, minor)
+        rangingConstraints[identifier] = constraint
+
+        // Reconciled after the assignment, never before: the reconcile decides what should be ranging
+        // from the constraints these identifiers now name, so it has to be reading the new one.
+        if let previous = previous,
+           CapacitorIbeacon.key(for: previous) != CapacitorIbeacon.key(for: constraint) {
+            beaconLog("CapacitorIbeacon: startMonitoring %@ - now names %@, was %@",
+                      identifier, CapacitorIbeacon.key(for: constraint), CapacitorIbeacon.key(for: previous))
+            automaticRanging.remove(identifier)
+            burstTimers[identifier]?.invalidate()
+            burstTimers.removeValue(forKey: identifier)
+            reconcileRanging()
+        }
 
         Task { [weak self] in
             guard let monitor = await self?.awaitMonitor() else {
@@ -836,7 +864,43 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
         }
     }
 
+    /*
+      Answers without constructing anything, because constructing is what asks the user.
+
+      Merely instantiating a CBPeripheralManager raises the Bluetooth permission prompt - the reason
+      withReadyPeripheralManager() defers it - so routing a getter through it put a dialog in front of
+      the user for a capability none of this needs. Monitoring and ranging are CoreLocation's
+      throughout; CoreBluetooth is here for startAdvertising() and nothing else. A status query that
+      prompts is wrong whatever it goes on to answer.
+
+      What can be told without asking:
+
+      - A manager that already exists, because the app has advertised, knows and is simply read.
+      - Refused or restricted authorization means Bluetooth is not this app's to use, whatever the
+      radio happens to be doing.
+      - Undetermined cannot be told at all. iOS offers no way to read the radio without first holding
+      permission to use it, so this reports false rather than buying an answer with a prompt: "this
+      app cannot currently use Bluetooth" is true either way, and it is the half that callers of a
+      beacon plugin can act on.
+
+      Callers gating beacon work on this should not: see getAuthorizationStatus(), which reports the
+      permission monitoring actually depends on.
+    */
     public func isBluetoothEnabled(completion: @escaping (Bool) -> Void) {
+        if let manager = peripheralManager, manager.state != .unknown {
+            completion(manager.state == .poweredOn)
+            return
+        }
+
+        guard CBManager.authorization == .allowedAlways else {
+            beaconLog("CapacitorIbeacon: isBluetoothEnabled - not authorized for this app, "
+                      + "reporting false rather than prompting")
+            completion(false)
+            return
+        }
+
+        // Authorization is already held, so there is no prompt left to raise and the real state is
+        // worth waiting for.
         withReadyPeripheralManager { manager in
             completion(manager.state == .poweredOn)
         }

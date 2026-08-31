@@ -299,6 +299,12 @@ const { status } = await CapacitorIbeacon.getAuthorizationStatus();
 
 Check if Bluetooth is enabled on the device.
 
+On iOS this reports whether **this app** can currently use Bluetooth, and never prompts. iOS offers no
+way to read the radio without first holding Bluetooth permission, and beacon monitoring never needs
+that permission - so it resolves to `false` until something has asked for it, which only
+`startAdvertising` does. Do not gate monitoring or ranging on this; `getAuthorizationStatus()` reports
+the permission they actually depend on.
+
 ```typescript
 const { enabled } = await CapacitorIbeacon.isBluetoothEnabled();
 if (!enabled) {
