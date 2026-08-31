@@ -154,8 +154,10 @@ export interface CapacitorIbeaconPlugin extends Plugin {
    * `authorized_when_in_use`, `authorized_always` or `authorized_reduced_accuracy`.
    *
    * `authorized_reduced_accuracy` means location was granted but Precise Location is off, which iOS
-   * treats as beacons being unavailable - monitoring and ranging report nothing at all. Only the user
-   * can change it, in Settings > (your app) > Location > Precise Location.
+   * treats as beacons being unavailable - monitoring and ranging report nothing at all. It is
+   * reported in place of whichever grant is held, `authorized_always` or `authorized_when_in_use`,
+   * since neither can see a beacon without it. Only the user can change it, in
+   * Settings > (your app) > Location > Precise Location.
    *
    * @returns Promise that resolves with authorization status
    * @throws Error if getting status fails

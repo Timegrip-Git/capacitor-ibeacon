@@ -157,9 +157,10 @@ nobody can hear. There is no way for an app to work around it - only the user ca
 
 The plugin reports the condition rather than trying to fix it:
 
-- `getAuthorizationStatus()` returns `authorized_reduced_accuracy` instead of `authorized_always`.
-  Treat it as "not usable for beacons" - if your code branches on `authorized_always`, handle this
-  value too, and prompt the user to turn Precise Location back on.
+- `getAuthorizationStatus()` returns `authorized_reduced_accuracy` in place of whichever grant is
+  held - `authorized_always` or `authorized_when_in_use`. Treat it as "not usable for beacons": if
+  your code branches on either of those values, handle this one too, and prompt the user to turn
+  Precise Location back on.
 - The accuracy is written to the native log at launch and in every monitoring audit.
 
 > **Note**: The plugin uses CoreLocation for beacon detection, which handles Bluetooth scanning internally. Direct Bluetooth permissions are only needed if your app also uses CoreBluetooth for other purposes (e.g., advertising as a beacon).

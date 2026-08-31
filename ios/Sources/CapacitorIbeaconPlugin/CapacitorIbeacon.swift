@@ -787,7 +787,24 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
     }
 
     public func getAuthorizationStatus() -> String {
-        switch currentAuthorizationStatus() {
+        let status = currentAuthorizationStatus()
+
+        /*
+          Reduced accuracy outranks which grant was given, because it settles the same question
+          either way: iOS declines to monitor or range beacons without Precise Location, under a
+          "when in use" grant exactly as under an "always" one. Reporting it for only one of the two
+          hands the other a status this plugin documents as usable and then gives it silence - which
+          is precisely the failure this value was added to name, arriving through the door left open.
+
+          Which grant is underneath stops mattering once the accuracy is coarse, so it is deliberately
+          not reported. Neither of them can see a beacon.
+        */
+        let granted = status == .authorizedAlways || status == .authorizedWhenInUse
+        if granted, !hasFullAccuracy() {
+            return "authorized_reduced_accuracy"
+        }
+
+        switch status {
         case .notDetermined:
             return "not_determined"
         case .restricted:
@@ -795,8 +812,7 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
         case .denied:
             return "denied"
         case .authorizedAlways:
-            // Not "always" in any useful sense for beacons if the location is coarse.
-            return hasFullAccuracy() ? "authorized_always" : "authorized_reduced_accuracy"
+            return "authorized_always"
         case .authorizedWhenInUse:
             return "authorized_when_in_use"
         @unknown default:
