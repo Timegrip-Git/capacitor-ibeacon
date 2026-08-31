@@ -92,6 +92,22 @@ Add the following keys to your `ios/App/App/Info.plist` file:
 - **When In Use**: For foreground beacon ranging and monitoring
 - **Always**: Required for background beacon monitoring (detecting beacons when app is not active)
 - **Bluetooth**: Automatically granted on iOS 13+ when using CoreLocation for beacons
+- **Precise Location**: Required. See below - beacons do not work without it, and an "Always" grant
+  is not enough on its own.
+
+#### Precise Location must be on (iOS 14+)
+
+iOS will not monitor or range iBeacon regions when the user has turned **Precise Location** off, and
+it reports this nowhere: no error, no failure callback, just silence that looks exactly like a beacon
+nobody can hear. There is no way for an app to work around it - only the user can turn it back on, in
+**Settings > (your app) > Location > Precise Location**.
+
+The plugin reports the condition rather than trying to fix it:
+
+- `getAuthorizationStatus()` returns `authorized_reduced_accuracy` instead of `authorized_always`.
+  Treat it as "not usable for beacons" - if your code branches on `authorized_always`, handle this
+  value too, and prompt the user to turn Precise Location back on.
+- The accuracy is written to the native log at launch and in every monitoring audit.
 
 > **Note**: The plugin uses CoreLocation for beacon detection, which handles Bluetooth scanning internally. Direct Bluetooth permissions are only needed if your app also uses CoreBluetooth for other purposes (e.g., advertising as a beacon).
 
@@ -209,7 +225,9 @@ Get current location authorization status.
 
 ```typescript
 const { status } = await CapacitorIbeacon.getAuthorizationStatus();
-// status: 'not_determined' | 'restricted' | 'denied' | 'authorized_always' | 'authorized_when_in_use'
+// status: 'not_determined' | 'restricted' | 'denied' | 'authorized_always'
+//       | 'authorized_when_in_use' | 'authorized_reduced_accuracy'
+// iOS: 'authorized_reduced_accuracy' means Precise Location is off, so beacons cannot work.
 ```
 
 ### isBluetoothEnabled()
@@ -334,6 +352,12 @@ async function setupBeaconMonitoring() {
     // Request permission
     const { status } = await CapacitorIbeacon.requestWhenInUseAuthorization();
     
+    if (status === 'authorized_reduced_accuracy') {
+      // iOS only: granted, but Precise Location is off - beacons report nothing at all.
+      console.error('Turn on Precise Location in Settings for this app');
+      return;
+    }
+
     if (status !== 'authorized_when_in_use' && status !== 'authorized_always') {
       console.error('Location permission denied');
       return;
@@ -482,7 +506,8 @@ interface BeaconAdvertisingOptions {
    ```typescript
    const { status } = await CapacitorIbeacon.getAuthorizationStatus();
    console.log('Auth status:', status);
-   // Should be 'authorized_when_in_use' or 'authorized_always'
+   // Should be 'authorized_when_in_use' or 'authorized_always'.
+   // On iOS, 'authorized_reduced_accuracy' means Precise Location is off - beacons will stay silent.
    ```
 
 6. **Check device compatibility**:

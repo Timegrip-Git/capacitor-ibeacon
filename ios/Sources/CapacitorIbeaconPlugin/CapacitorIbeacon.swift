@@ -468,33 +468,17 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
       monitoringDidFail, just permanent silence that is indistinguishable from a beacon nobody can
       hear. Ranging gives it away - every measurement comes back rssi 0, accuracy -1.
 
-      So being granted "always" is not enough, and precise access is asked for outright. The prompt
-      needs NSLocationTemporaryUsageDescriptionDictionary with this key in the host app's Info.plist;
-      without the entry iOS ignores the request, which is why the outcome is logged either way.
+      So being granted "always" is not enough, and the accuracy is reported rather than fixed: it is
+      in the launch line, in every audit, and in getAuthorizationStatus() as
+      authorized_reduced_accuracy. Only Settings > the app > Location > Precise Location settles it.
+
+      Asking in-app was tried and removed. requestTemporaryFullAccuracyAuthorization grants accuracy
+      for the session, which is the one span this plugin does not need it for - monitoring outlives
+      the process, and the Core Location background relaunch that delivers a crossing has no
+      foreground to prompt in. It also needs NSLocationTemporaryUsageDescriptionDictionary in the
+      host app's Info.plist, so a host that had not been told to add the entry got a request iOS
+      silently ignored.
     */
-    public func ensureFullAccuracy(completion: @escaping (Bool) -> Void) {
-        guard #available(iOS 14.0, *) else {
-            completion(true)
-            return
-        }
-
-        if locationManager.accuracyAuthorization == .fullAccuracy {
-            completion(true)
-            return
-        }
-
-        locationManager.requestTemporaryFullAccuracyAuthorization(withPurposeKey: "BeaconMonitoring") { [weak self] error in
-            let granted = self?.locationManager.accuracyAuthorization == .fullAccuracy
-            if let error = error {
-                beaconLog("CapacitorIbeacon: precise location request failed: %@", error.localizedDescription)
-            }
-            beaconLog("CapacitorIbeacon: precise location %@ - beacon monitoring %@",
-                  granted ? "granted" : "NOT granted",
-                  granted ? "can report crossings" : "will stay silent")
-            completion(granted)
-        }
-    }
-
     public func hasFullAccuracy() -> Bool {
         if #available(iOS 14.0, *) {
             return locationManager.accuracyAuthorization == .fullAccuracy
@@ -507,12 +491,10 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
         authorizationCallbacks.removeAll()
         authorizationTarget = nil
 
-        // Reduced accuracy makes an "always" grant useless for beacons, so the answer is not final
-        // until precise access has been asked for as well.
-        ensureFullAccuracy { [weak self] _ in
-            let status = self?.getAuthorizationStatus() ?? "unknown"
-            callbacks.forEach { $0(status) }
-        }
+        // Reduced accuracy makes an "always" grant useless for beacons, which is why the status this
+        // reports distinguishes the two - see hasFullAccuracy().
+        let status = getAuthorizationStatus()
+        callbacks.forEach { $0(status) }
     }
 
     private func currentAuthorizationStatus() -> CLAuthorizationStatus {
