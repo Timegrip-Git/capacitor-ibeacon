@@ -1,8 +1,7 @@
 import Foundation
 
 /*
-  TEMPORARY diagnostics, off unless the host app sets it - the file counterpart of
-  diagnosticRangingEnabled, and enabled the same way, through start(diagnosticLogFile:).
+  TEMPORARY diagnostics, off unless the host app turns them on through start(diagnosticLogFile:).
 
   Everything this plugin says goes to NSLog, which can only be read while something is attached to
   the console - and the events that matter most here cannot be observed that way. A crossing is

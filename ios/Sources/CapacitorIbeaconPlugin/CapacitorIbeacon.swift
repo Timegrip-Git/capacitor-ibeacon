@@ -40,19 +40,6 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
     private var reportedRegionStates: [String: CLRegionState] = [:]
     private let initialStateRetryDelay: TimeInterval = 3.0
 
-    /*
-      TEMPORARY diagnostics, off unless the host app sets it.
-
-      Monitoring only speaks when Core Location decides a boundary was crossed, so silence is
-      ambiguous: it means either "the beacons were never heard" or "they were heard throughout and
-      no crossing was declared". Ranging reports continuously and tells those apart - the same
-      question the per-detection log answered on Android, where the beacons turned out to be heard
-      every 1.3s while exits were being declared anyway.
-    */
-    public var diagnosticRangingEnabled = false
-    private var lastRangeLog: [String: Date] = [:]
-    private let rangeLogInterval: TimeInterval = 20
-
     private var authorizationCallbacks: [(String) -> Void] = []
     private var authorizationTarget: CLAuthorizationStatus?
     private let authorizationTimeout: TimeInterval = 60.0
@@ -127,8 +114,7 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
         }
     }
 
-    public func start(diagnosticRanging: Bool = false, diagnosticLogFile: Bool = false) {
-        diagnosticRangingEnabled = diagnosticRanging
+    public func start(diagnosticLogFile: Bool = false) {
         // Before the first line below, so that the launch state - the authorization and accuracy that
         // decide whether monitoring can report anything at all - is in the file rather than only in a
         // console nobody was attached to. See CapacitorIbeaconDiagnosticLog.
@@ -153,13 +139,6 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
             guard let beaconRegion = region as? CLBeaconRegion else { continue }
             monitoredRegions[beaconRegion.identifier] = beaconRegion
             adopted.append(beaconRegion.identifier)
-        }
-
-        if diagnosticRangingEnabled {
-            for (identifier, region) in monitoredRegions {
-                locationManager.startRangingBeacons(in: region)
-                beaconLog("CapacitorIbeacon: diagnostic ranging started for %@ (adopted)", identifier)
-            }
         }
 
         // Also the marker for "is this build running the process-scoped monitoring?", which is
@@ -313,23 +292,16 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
         */
         if !alreadyMonitored {
             locationManager.startMonitoring(for: beaconRegion)
-        }
 
-        /*
-          Core Location reports boundary crossings only, so a region selected while already inside it
-          would stay silent until it was left and re-entered. Android reports it as soon as the beacon
-          is heard, so the state is asked for outright - but only for a region that is genuinely new,
-          which is the one case where the answer is news rather than a restatement.
+            /*
+              Core Location reports boundary crossings only, so a region selected while already inside
+              it would stay silent until it was left and re-entered. Android reports it as soon as the
+              beacon is heard, so the state is asked for outright - but only for a region that is
+              genuinely new, which is the one case where the answer is news rather than a restatement.
 
-          Asked twice, because a beacon region's state comes back .unknown until the OS has had a
-          chance to scan - the retry only fires while nothing definite has arrived.
-        */
-        if diagnosticRangingEnabled {
-            locationManager.startRangingBeacons(in: beaconRegion)
-            beaconLog("CapacitorIbeacon: diagnostic ranging started for %@", identifier)
-        }
-
-        if !alreadyMonitored {
+              Asked twice, because a beacon region's state comes back .unknown until the OS has had a
+              chance to scan - the retry only fires while nothing definite has arrived.
+            */
             locationManager.requestState(for: beaconRegion)
             DispatchQueue.main.asyncAfter(deadline: .now() + initialStateRetryDelay) { [weak self] in
                 guard let self = self,
@@ -535,23 +507,6 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
     // MARK: - CLLocationManagerDelegate
 
     public func locationManager(_ manager: CLLocationManager, didRangeBeacons beacons: [CLBeacon], in region: CLBeaconRegion) {
-        if diagnosticRangingEnabled {
-            // Throttled: this fires about once a second per region while the app is in the
-            // foreground. An empty list is the interesting case - it means the OS is scanning and
-            // hearing nothing, as opposed to not scanning at all.
-            let now = Date()
-            if now.timeIntervalSince(lastRangeLog[region.identifier] ?? .distantPast) >= rangeLogInterval {
-                lastRangeLog[region.identifier] = now
-                if beacons.isEmpty {
-                    beaconLog("CapacitorIbeacon: ranged %@ - nothing heard", region.identifier)
-                } else {
-                    let detail = beacons.map { "rssi \($0.rssi) accuracy \(String(format: "%.1f", $0.accuracy))" }
-                        .joined(separator: "; ")
-                    beaconLog("CapacitorIbeacon: ranged %@ - %d heard: %@", region.identifier, beacons.count, detail)
-                }
-            }
-        }
-
         var beaconsArray: [[String: Any]] = []
 
         for beacon in beacons {
