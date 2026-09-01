@@ -284,6 +284,11 @@ records that always-operation was configured and re-takes the session on every l
 background relaunches - so call this once from the foreground when the user opts into background
 monitoring, and the plugin keeps it held from then on.
 
+The re-take is conditional on the grant still being in hand. Taking a session is also how iOS is
+asked for "always" authorization, so a launch that re-took one after the user had revoked or reset
+the permission would open the app with a permission dialog nobody asked for. Where the grant is
+gone, the plugin takes no session and raises no prompt; calling this method again is what asks.
+
 Request "Always" location authorization (required for background monitoring).
 
 ```typescript

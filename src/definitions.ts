@@ -136,7 +136,9 @@ export interface CapacitorIbeaconPlugin extends Plugin {
    * iOS 18+: this also takes the CLServiceSession that iOS requires in order to use an "always"
    * grant - an app holding the grant but no session receives no monitoring events while it is not
    * in-use. Call it once from the foreground when the user opts into background monitoring; the
-   * plugin re-takes the session on every later launch, background relaunches included.
+   * plugin re-takes the session on every later launch, background relaunches included, for as long
+   * as the grant lasts. Should the user withdraw it, the plugin stops taking a session rather than
+   * raising a prompt of its own at launch - asking again is this method's job, and the user's.
    *
    * @returns Promise that resolves with authorization status
    * @throws Error if request fails

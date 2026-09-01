@@ -815,7 +815,7 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
     }
 
     /*
-      Re-taken at launch, and only if it was configured before.
+      Re-taken at launch, and only if it was configured before and the grant is still in hand.
 
       CLServiceSession.h allows a session to be created while in-use, or "immediately when launched
       in the background if a matching session was held when previously running" - and Apple's
@@ -823,12 +823,31 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
       background". So the durable flag is not a convenience, it is the thing that makes this legal:
       without evidence that always-operation was configured in an earlier run, taking a session here
       would only earn insufficientlyInUse.
+
+      The flag alone is not enough to act on, though, and this is the second half of the guard rather
+      than a belt-and-braces one. A session with an always requirement makes Location Services *seek*
+      that authorization - that is exactly how requestAlwaysAuthorization() asks - so taking one
+      without the grant already in hand puts a permission prompt on screen at launch, before the user
+      has touched anything. The flag outlives the grant it records: "Ask Next Time Or When I Share"
+      and Reset Location & Privacy both return the status to notDetermined while leaving the app's
+      stored defaults untouched, and a downgrade to when-in-use leaves it standing too. Every one of
+      those launches would otherwise open with an unprovoked dialog.
+
+      Asking again is the frontend's business, through requestAlwaysAuthorization(), where a prompt is
+      something the user provoked. All this needs is a grant to make usable.
     */
     private func retakeServiceSessionIfConfigured() {
         guard UserDefaults.standard.bool(forKey: CapacitorIbeacon.alwaysConfiguredKey) else {
             beaconLog("CapacitorIbeacon: no always-operation on record, no service session taken")
             return
         }
+
+        guard currentAuthorizationStatus() == .authorizedAlways else {
+            beaconLog("CapacitorIbeacon: always-operation on record but authorization is %@ - no service session taken, and no prompt raised for one",
+                      getAuthorizationStatus())
+            return
+        }
+
         takeServiceSession(recordAsConfigured: false)
     }
 
@@ -1046,8 +1065,23 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
           this process actually asked for is recorded. A user who grants "always" in Settings to an
           app that never wanted it leaves nothing behind for the next launch to act on.
         */
-        if status == .authorizedAlways, serviceSession != nil {
-            UserDefaults.standard.set(true, forKey: CapacitorIbeacon.alwaysConfiguredKey)
+        if status == .authorizedAlways {
+            if serviceSession != nil {
+                UserDefaults.standard.set(true, forKey: CapacitorIbeacon.alwaysConfiguredKey)
+            } else if UserDefaults.standard.bool(forKey: CapacitorIbeacon.alwaysConfiguredKey) {
+                /*
+                  Always-operation was configured before and the grant has just come back - from
+                  Settings, or from a prompt this process did not raise. The launch retake above
+                  declined to take a session because the grant was missing at the time, and without
+                  one an always-authorized app still receives no monitor events while not in-use, so
+                  the grant would sit there doing nothing until the next launch noticed it.
+
+                  No prompt can come of this: the authorization the session requires is the one that
+                  just arrived.
+                */
+                beaconLog("CapacitorIbeacon: always granted with a session owed - taking it now")
+                takeServiceSession(recordAsConfigured: false)
+            }
         }
 
         guard !authorizationCallbacks.isEmpty, status != .notDetermined else { return }
