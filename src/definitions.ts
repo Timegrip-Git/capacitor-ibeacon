@@ -419,11 +419,6 @@ export interface BeaconRegion {
   minor?: number;
 
   /**
-   * Notify when device enters region (iOS only).
-   */
-  notifyEntryStateOnDisplay?: boolean;
-
-  /**
    * Enable Android background mode for this monitoring/ranging call.
    * When true, the plugin will keep scanning in background using a foreground service.
    */

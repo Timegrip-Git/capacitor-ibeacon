@@ -496,7 +496,8 @@ interface BeaconRegion {
   uuid: string;
   major?: number;
   minor?: number;
-  notifyEntryStateOnDisplay?: boolean;
+  enableBackgroundMode?: boolean;   // Android only
+  enableAutomaticRanging?: boolean; // iOS only, default false
 }
 ```
 
