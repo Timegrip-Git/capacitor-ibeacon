@@ -31,6 +31,8 @@ import org.altbeacon.beacon.MonitorNotifier;
 import org.altbeacon.beacon.RangeNotifier;
 import org.altbeacon.beacon.Region;
 import org.altbeacon.beacon.Settings;
+import org.altbeacon.beacon.service.ArmaRssiFilter;
+import org.altbeacon.beacon.service.RunningAverageRssiFilter;
 
 @CapacitorPlugin(
     name = "CapacitorIbeacon",
@@ -722,19 +724,34 @@ public class CapacitorIbeaconPlugin extends Plugin {
         call.resolve(ret);
     }
 
+    /*
+      Selects which RSSI filter smooths the readings a distance is computed from.
+
+      It used to set a distance calculator instead, and not even a different one: the
+      ModelSpecificDistanceCalculator it installed is what AltBeacon already uses, so enabling the
+      "ARMA filter" replaced the default with the default and no ARMA filter existed anywhere in the
+      process. `enabled: false` did nothing at all, having nothing to undo.
+
+      ARMA is one of the two RssiFilter implementations AltBeacon ships, chosen through
+      setRssiFilterImplClass. Off restores RunningAverageRssiFilter, which is what RangedBeacon falls
+      back to when nothing is set - named explicitly rather than cleared to null, so the library has
+      no cause to log that it is defaulting.
+
+      Applies to beacons first seen after this call: the filter is built per ranged beacon when that
+      beacon is first ranged, so anything already in range keeps the filter it started with.
+    */
     @PluginMethod
     public void enableARMAFilter(PluginCall call) {
         Boolean enabled = call.getBoolean("enabled", false);
-        if (enabled != null && enabled) {
-            // Enable ARMA (Auto-Regressive Moving Average) filter for distance smoothing
-            Beacon.setDistanceCalculator(
-                new org.altbeacon.beacon.distance.ModelSpecificDistanceCalculator(
-                    getContext(),
-                    org.altbeacon.beacon.BeaconManager.getDistanceModelUpdateUrl()
-                )
-            );
+        boolean wantArma = enabled != null && enabled;
+
+        try {
+            BeaconManager.setRssiFilterImplClass(wantArma ? ArmaRssiFilter.class : RunningAverageRssiFilter.class);
+            android.util.Log.i(TAG, "RSSI filter set to " + (wantArma ? "ARMA" : "running average"));
+            call.resolve();
+        } catch (Exception e) {
+            call.reject("Failed to set the RSSI filter", e);
         }
-        call.resolve();
     }
 
     @PluginMethod

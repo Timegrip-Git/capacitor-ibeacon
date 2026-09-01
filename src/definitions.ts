@@ -215,6 +215,13 @@ export interface CapacitorIbeaconPlugin extends Plugin {
   /**
    * Enable ARMA filtering for distance calculations (Android only).
    *
+   * Chooses which of AltBeacon's RSSI filters smooths the readings a distance is computed from:
+   * `true` selects the ARMA (auto-regressive moving average) filter, `false` restores the running
+   * average, which is the library default.
+   *
+   * Takes effect for beacons first seen after the call. The filter is created per beacon when that
+   * beacon is first ranged, so anything already in range keeps the filter it started with.
+   *
    * @param options - ARMA filter configuration
    * @returns Promise that resolves when filter is configured
    * @throws Error if configuration fails
