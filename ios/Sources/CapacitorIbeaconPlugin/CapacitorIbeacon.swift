@@ -565,6 +565,25 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
         Task { [weak self] in
             guard let monitor = await self?.awaitMonitor() else {
                 DispatchQueue.main.async {
+                    /*
+                      What was written ahead of the registration is taken back, because the
+                      registration did not happen.
+
+                      conditions and the ranging request are set synchronously so that the
+                      identifier-keyed API can answer for a region the moment it is asked for. When
+                      the monitor never opens they describe one CLMonitor has never heard of, and
+                      auditMonitoring() compares the two: it would report a MISMATCH on every audit
+                      for the rest of the process, so the line that exists to expose a dropped
+                      condition would instead be permanently occupied by this.
+
+                      rangingConstraints is deliberately left. It is a lookup table rather than a
+                      claim about what is monitored, and startRangingBeaconsInRegion may be relying
+                      on the entry for this same identifier.
+                    */
+                    self?.conditions.removeValue(forKey: identifier)
+                    self?.automaticRangingRequested.remove(identifier)
+                    self?.endRanging(for: identifier)
+
                     completion(.failure(NSError(domain: "CapacitorIbeacon", code: -3,
                                                 userInfo: [NSLocalizedDescriptionKey: "Monitoring is unavailable"])))
                 }
