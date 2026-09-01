@@ -71,7 +71,14 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
     // as "Bluetooth is off" while it is merely undecided.
     private let peripheralManagerStateTimeout: TimeInterval = 30.0
 
-    private var authorizationCallbacks: [(String) -> Void] = []
+    /*
+      Keyed, so that a timeout belongs to the request that started it.
+
+      A grant is shared - when the delegate speaks, everyone waiting hears the same answer - but a
+      timeout is not. Held in a plain array, the first request to time out settled every callback in
+      it, including ones added moments earlier that had most of their own minute still to run.
+    */
+    private var authorizationCallbacks: [UUID: (String) -> Void] = [:]
     private var authorizationTarget: CLAuthorizationStatus?
     private let authorizationTimeout: TimeInterval = 60.0
 
@@ -842,13 +849,14 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
             return
         }
 
+        let token = UUID()
         authorizationTarget = target
-        authorizationCallbacks.append(completion)
+        authorizationCallbacks[token] = completion
         request()
 
+        // This request's own deadline, and nobody else's.
         DispatchQueue.main.asyncAfter(deadline: .now() + authorizationTimeout) { [weak self] in
-            guard let self = self, !self.authorizationCallbacks.isEmpty else { return }
-            self.settleAuthorization()
+            self?.settleAuthorization(token)
         }
     }
 
@@ -941,8 +949,9 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
         return locationManager.accuracyAuthorization == .fullAccuracy
     }
 
+    // Everyone waiting, because an answer from the delegate is the answer to all of them.
     private func settleAuthorization() {
-        let callbacks = authorizationCallbacks
+        let callbacks = Array(authorizationCallbacks.values)
         authorizationCallbacks.removeAll()
         authorizationTarget = nil
 
@@ -950,6 +959,21 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
         // reports distinguishes the two - see hasFullAccuracy().
         let status = getAuthorizationStatus()
         callbacks.forEach { $0(status) }
+    }
+
+    /*
+      One waiter, because a timeout is not an answer - it is one request giving up.
+
+      Whatever else is still outstanding keeps its own deadline. The target is cleared only when the
+      last one goes, since it describes what the delegate should still be waiting for rather than
+      anything belonging to this request.
+    */
+    private func settleAuthorization(_ token: UUID) {
+        guard let completion = authorizationCallbacks.removeValue(forKey: token) else { return }
+        if authorizationCallbacks.isEmpty {
+            authorizationTarget = nil
+        }
+        completion(getAuthorizationStatus())
     }
 
     private func currentAuthorizationStatus() -> CLAuthorizationStatus {
