@@ -187,7 +187,7 @@ public class CapacitorIbeaconPlugin extends Plugin {
                 backgroundModeEnabled = true;
             }
 
-            applyBackgroundMode(backgroundModeEnabled);
+            applyBackgroundMode();
         } catch (Exception e) {
             android.util.Log.e(TAG, "Beacon monitoring was not fully initialized", e);
         }
@@ -207,7 +207,7 @@ public class CapacitorIbeaconPlugin extends Plugin {
         if (!foregroundServiceEnabled || (monitoredRegions.isEmpty() && rangedRegions.isEmpty())) {
             unbindIfNeeded();
         } else {
-            applyBackgroundMode(backgroundModeEnabled);
+            applyBackgroundMode();
         }
         super.handleOnDestroy();
     }
@@ -288,14 +288,14 @@ public class CapacitorIbeaconPlugin extends Plugin {
     protected void handleOnPause() {
         super.handleOnPause();
         isInBackground = true;
-        applyBackgroundMode(backgroundModeEnabled);
+        applyBackgroundMode();
     }
 
     @Override
     protected void handleOnResume() {
         super.handleOnResume();
         isInBackground = false;
-        applyBackgroundMode(backgroundModeEnabled);
+        applyBackgroundMode();
     }
 
     // The consumer holds the service binding, so it must not be tied to the Activity: binding from an
@@ -922,14 +922,30 @@ public class CapacitorIbeaconPlugin extends Plugin {
 
     private void setBackgroundModeEnabled(boolean enabled) {
         backgroundModeEnabled = enabled;
-        applyBackgroundMode(enabled);
+        // Still applied, because ensureForegroundServiceMatches() may have just rebound the manager
+        // and a rebind does not carry the scan mode with it.
+        applyBackgroundMode();
     }
 
-    private void applyBackgroundMode(boolean enabled) {
+    /*
+      Tells AltBeacon which scan periods apply, and nothing else.
+
+      setBackgroundMode() is a statement of fact - the app is or is not in the background - and it
+      selects the scan periods accordingly. It was being passed `backgroundModeEnabled && isInBackground`,
+      which folded a policy into that fact and inverted the result: with background mode off and the
+      app backgrounded it said "foreground", so the configuration asking for the least background
+      work selected the most expensive scan there is - the foreground periods, 1100ms every 1100ms,
+      continuous - and ran it behind a backgrounded app. handleOnPause() does not unbind, so that was
+      most of a day for anyone who did not opt into background mode.
+
+      Whether to keep scanning in the background at all is the other question, and it is answered
+      elsewhere: backgroundModeEnabled drives the foreground service, in ensureForegroundServiceMatches().
+    */
+    private void applyBackgroundMode() {
         if (beaconManager == null) {
             return;
         }
-        beaconManager.setBackgroundMode(enabled && isInBackground);
+        beaconManager.setBackgroundMode(isInBackground);
     }
 
     // Covers both a fresh bind and a later call (e.g. a per-region enableBackgroundMode option)
