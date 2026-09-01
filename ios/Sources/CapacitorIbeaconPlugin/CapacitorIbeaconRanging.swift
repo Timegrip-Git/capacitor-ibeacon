@@ -154,12 +154,20 @@ extension CapacitorIbeacon {
 
           Ranging is keyed by beacon identity while this plugin's API is keyed by name, and the two
           are not one-to-one: the same uuid/major/minor can be registered under several identifiers,
-          and iOS ranges it once. Each of them is told, because each of them asked - which is also
-          why ranging is reconciled by constraint rather than by identifier.
+          and iOS ranges it once. Each identifier that is ranging it is told - which is also why
+          ranging is reconciled by constraint rather than by identifier.
+
+          Only the ones ranging it, though, which is what explicitRanging and automaticRanging
+          together say. Matching on the constraint alone also reached identifiers that merely monitor
+          the same beacon, so a region registered without enableAutomaticRanging received the very
+          events it had declined, as soon as some other identifier for that beacon was ranged. The
+          union here is the same one reconcileRanging() starts from, so what is reported and what was
+          asked for cannot drift apart.
         */
         let key = CapacitorIbeacon.key(for: constraint)
+        let ranging = explicitRanging.union(automaticRanging)
         let identifiers = rangingConstraints
-            .filter { CapacitorIbeacon.key(for: $0.value) == key }
+            .filter { ranging.contains($0.key) && CapacitorIbeacon.key(for: $0.value) == key }
             .map { $0.key }
             .sorted()
 

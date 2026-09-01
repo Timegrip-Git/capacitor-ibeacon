@@ -298,6 +298,28 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
             announcedInside[identifier] = entry.inside
         }
 
+        /*
+          Requests for regions nothing monitors any more are dropped here, which is the only place
+          they can be.
+
+          automaticRangingRequested loses an identifier when a caller stops monitoring it or asks for
+          automatic ranging to stop. A frontend that simply stops naming a region does neither, so
+          the request would sit in UserDefaults for the life of the install, describing something
+          nothing can range. Harmless while it runs - beginRanging() wants a constraint the
+          identifier no longer has - but it only ever grows, and a launch is when the full set of
+          real regions is known.
+
+          Measured against conditions rather than against what was just adopted: a
+          startMonitoringForRegion that landed before the monitor finished opening is already in
+          there and is not stale.
+        */
+        let forgotten = automaticRangingRequested.subtracting(Set(conditions.keys))
+        if !forgotten.isEmpty {
+            automaticRangingRequested.subtract(forgotten)
+            beaconLog("CapacitorIbeacon: dropped automatic ranging for %d unmonitored region(s): %@",
+                      forgotten.count, forgotten.sorted().joined(separator: ", "))
+        }
+
         let names = adopted.map { "\($0.identifier)\($0.inside ? " (inside)" : "")" }.sorted()
 
         // Also the marker for "is this build running the process-scoped monitoring?", which is
