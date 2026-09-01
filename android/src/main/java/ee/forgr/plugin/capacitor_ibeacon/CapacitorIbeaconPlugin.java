@@ -3,9 +3,6 @@ package ee.forgr.plugin.capacitor_ibeacon;
 import android.Manifest;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothManager;
-import android.content.Context;
-import android.content.Intent;
-import android.content.ServiceConnection;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import androidx.core.app.ActivityCompat;
@@ -24,7 +21,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import org.altbeacon.beacon.Beacon;
-import org.altbeacon.beacon.BeaconConsumer;
 import org.altbeacon.beacon.BeaconManager;
 import org.altbeacon.beacon.BeaconParser;
 import org.altbeacon.beacon.Identifier;
@@ -77,11 +73,8 @@ public class CapacitorIbeaconPlugin extends Plugin {
     private static final Map<String, Region> rangedRegions = new ConcurrentHashMap<>();
     private static MonitorNotifier monitorNotifier;
     private static RangeNotifier rangeNotifier;
-    private static BeaconConsumer beaconConsumer;
-    private static boolean beaconManagerBound = false;
     private static boolean backgroundModeEnabled = false;
     private static boolean foregroundServiceEnabled = false;
-    private static boolean isInBackground = false;
 
     // The instance whose bridge is currently alive, or null while no Activity is up. Scan callbacks
     // are routed through it so they always reach the live WebView, and are dropped when there is none
@@ -111,7 +104,6 @@ public class CapacitorIbeaconPlugin extends Plugin {
             // Initialize beacon manager
             beaconManager = BeaconManager.getInstanceForApplication(getContext());
             activeInstance = this;
-            isInBackground = false;
 
             // Set up iBeacon layout parser, unless it is already in the application-wide list
             if (!hasIBeaconParser()) {
@@ -122,7 +114,7 @@ public class CapacitorIbeaconPlugin extends Plugin {
             // is applied whether or not a scan is already running.
             BeaconManager.setRegionExitPeriod(REGION_EXIT_PERIOD);
 
-            if (beaconManagerBound || beaconManager.isAnyConsumerBound()) {
+            if (beaconManager.isAnyConsumerBound()) {
                 // A scan is already running in this process, so the settings below may no longer be
                 // applied - AltBeacon throws once a consumer is bound. Take over the running scan
                 // instead, including anything a previous process left actively monitored.
@@ -181,16 +173,12 @@ public class CapacitorIbeaconPlugin extends Plugin {
                 BeaconManager.setDebug(true);
             }
 
-            // bind() is deferred to bindIfNeeded().
-
             addNotifiersIfNeeded();
 
             Boolean configBackgroundMode = getConfig().getBoolean("enableBackgroundMode", false);
             if (configBackgroundMode != null && configBackgroundMode) {
                 backgroundModeEnabled = true;
             }
-
-            applyBackgroundMode();
         } catch (Exception e) {
             android.util.Log.e(TAG, "Beacon monitoring was not fully initialized", e);
         }
@@ -205,13 +193,14 @@ public class CapacitorIbeaconPlugin extends Plugin {
         if (activeInstance == this) {
             activeInstance = null;
         }
-        isInBackground = true;
 
-        if (!foregroundServiceEnabled || (monitoredRegions.isEmpty() && rangedRegions.isEmpty())) {
-            unbindIfNeeded();
-        } else {
-            applyBackgroundMode();
-        }
+        /*
+          Nothing is torn down for the Activity's sake any more. AltBeacon binds and unbinds itself
+          around the regions it is watching, so a scan that should continue continues and one with
+          nothing left to watch has already gone - and without a foreground service there is nothing
+          holding this process up regardless.
+        */
+        releaseIfNothingLeftToWatch();
         super.handleOnDestroy();
     }
 
@@ -287,53 +276,6 @@ public class CapacitorIbeaconPlugin extends Plugin {
         return plugin;
     }
 
-    @Override
-    protected void handleOnPause() {
-        super.handleOnPause();
-        isInBackground = true;
-        applyBackgroundMode();
-    }
-
-    @Override
-    protected void handleOnResume() {
-        super.handleOnResume();
-        isInBackground = false;
-        applyBackgroundMode();
-    }
-
-    // The consumer holds the service binding, so it must not be tied to the Activity: binding from an
-    // Activity context makes Android tear the binding down when that Activity is destroyed, while
-    // AltBeacon goes on listing the consumer as bound. One application-scoped consumer per process
-    // keeps the binding and AltBeacon's view of it in agreement.
-    private static final class ApplicationBeaconConsumer implements BeaconConsumer {
-
-        private final Context applicationContext;
-
-        private ApplicationBeaconConsumer(Context context) {
-            this.applicationContext = context.getApplicationContext();
-        }
-
-        @Override
-        public void onBeaconServiceConnect() {
-            // beaconManagerBound is already set synchronously wherever bind() is called.
-        }
-
-        @Override
-        public Context getApplicationContext() {
-            return applicationContext;
-        }
-
-        @Override
-        public void unbindService(ServiceConnection serviceConnection) {
-            applicationContext.unbindService(serviceConnection);
-        }
-
-        @Override
-        public boolean bindService(Intent intent, ServiceConnection serviceConnection, int flags) {
-            return applicationContext.bindService(intent, serviceConnection, flags);
-        }
-    }
-
     @PluginMethod
     public void startMonitoringForRegion(PluginCall call) {
         String identifier = call.getString("identifier");
@@ -351,7 +293,7 @@ public class CapacitorIbeaconPlugin extends Plugin {
             if (enableBackgroundMode != null) {
                 setBackgroundModeEnabled(enableBackgroundMode);
             }
-            bindIfNeeded();
+            prepareToScan();
             Region region = createRegion(identifier, uuid, major, minor);
             monitoredRegions.put(identifier, region);
             beaconManager.startMonitoring(region);
@@ -401,7 +343,7 @@ public class CapacitorIbeaconPlugin extends Plugin {
             if (enableBackgroundMode != null) {
                 setBackgroundModeEnabled(enableBackgroundMode);
             }
-            bindIfNeeded();
+            prepareToScan();
             Region region = createRegion(identifier, uuid, major, minor);
             rangedRegions.put(identifier, region);
             beaconManager.startRangingBeacons(region);
@@ -792,7 +734,7 @@ public class CapacitorIbeaconPlugin extends Plugin {
         try {
             beaconManager.setBackgroundScanPeriod(scanPeriod);
             beaconManager.setBackgroundBetweenScanPeriod(betweenScanPeriod);
-            if (beaconManagerBound) {
+            if (beaconManager.isAnyConsumerBound()) {
                 beaconManager.updateScanPeriods();
             }
             call.resolve();
@@ -925,18 +867,15 @@ public class CapacitorIbeaconPlugin extends Plugin {
         }
     }
 
-    private void bindIfNeeded() {
+    /*
+      All that has to happen before a scan starts: the foreground service must already be in the
+      state the caller asked for, because AltBeacon refuses to change it once anything is bound.
+
+      Binding itself is not ours any more. startMonitoring() and startRangingBeacons() autobind, and
+      release the binding again when the last region stops, so there is nothing here to hold.
+    */
+    private void prepareToScan() {
         ensureForegroundServiceMatches(backgroundModeEnabled);
-        if (beaconManagerBound || beaconManager == null) {
-            return;
-        }
-        if (beaconConsumer == null) {
-            beaconConsumer = new ApplicationBeaconConsumer(getContext());
-        }
-        // Set before bind() - AltBeacon is synchronously bound inside bind() itself, not only
-        // once onBeaconServiceConnect() fires.
-        beaconManagerBound = true;
-        beaconManager.bind(beaconConsumer);
     }
 
     /*
@@ -948,57 +887,34 @@ public class CapacitorIbeaconPlugin extends Plugin {
       with nothing left to find. Only destroying the Activity cleared it, and with a foreground
       service holding the process up that need never happen.
 
-      Safe to call when the maps were already empty: unbindIfNeeded() is idempotent, and there is
-      nothing being served in that state either. Whatever comes next calls bindIfNeeded(), which
-      brings the binding and the service back with it.
+      The scan and its binding stop on their own once the last region does - that is what autobind
+      means - so the only thing left to take down here is the foreground service, which AltBeacon has
+      no reason to know is finished with. Safe when the maps were already empty:
+      disableForegroundServiceIfNeeded() is idempotent, and whatever comes next calls prepareToScan().
     */
     private void releaseIfNothingLeftToWatch() {
-        if (monitoredRegions.isEmpty() && rangedRegions.isEmpty()) {
-            unbindIfNeeded();
+        if (beaconManager != null && monitoredRegions.isEmpty() && rangedRegions.isEmpty()) {
+            disableForegroundServiceIfNeeded();
         }
-    }
-
-    private void unbindIfNeeded() {
-        if (beaconManager == null) {
-            return;
-        }
-        if (beaconManagerBound && beaconConsumer != null) {
-            beaconManager.unbind(beaconConsumer);
-            beaconManagerBound = false;
-        }
-        disableForegroundServiceIfNeeded();
-    }
-
-    private void setBackgroundModeEnabled(boolean enabled) {
-        backgroundModeEnabled = enabled;
-        // Still applied, because ensureForegroundServiceMatches() may have just rebound the manager
-        // and a rebind does not carry the scan mode with it.
-        applyBackgroundMode();
     }
 
     /*
-      Tells AltBeacon which scan periods apply, and nothing else.
+      The flag drives the foreground service and nothing else now.
 
-      setBackgroundMode() is a statement of fact - the app is or is not in the background - and it
-      selects the scan periods accordingly. It was being passed `backgroundModeEnabled && isInBackground`,
-      which folded a policy into that fact and inverted the result: with background mode off and the
-      app backgrounded it said "foreground", so the configuration asking for the least background
-      work selected the most expensive scan there is - the foreground periods, 1100ms every 1100ms,
-      continuous - and ran it behind a backgrounded app. handleOnPause() does not unbind, so that was
-      most of a day for anyone who did not opt into background mode.
-
-      Whether to keep scanning in the background at all is the other question, and it is answered
-      elsewhere: backgroundModeEnabled drives the foreground service, in ensureForegroundServiceMatches().
+      It used to drive setBackgroundMode() as well, and that call is gone rather than corrected.
+      AltBeacon infers foreground and background for itself from the process lifecycle - but only
+      while the app has never set it by hand, since enableDefaultBackgroundStateInference() gives way
+      the moment the value stops being uninitialized. Calling it was therefore switching the
+      library's own inference off and replacing it with this plugin's, which watched a single
+      Activity pausing rather than the process losing the foreground, and got it wrong whenever the
+      two differed.
     */
-    private void applyBackgroundMode() {
-        if (beaconManager == null) {
-            return;
-        }
-        beaconManager.setBackgroundMode(isInBackground);
+    private void setBackgroundModeEnabled(boolean enabled) {
+        backgroundModeEnabled = enabled;
     }
 
-    // Covers both a fresh bind and a later call (e.g. a per-region enableBackgroundMode option)
-    // that raises the requirement while already bound.
+    // Covers both the first scan of a run and a later call (e.g. a per-region enableBackgroundMode
+    // option) that changes the requirement while a scan is already going.
     private boolean ensureForegroundServiceMatches(boolean wantForegroundService) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || wantForegroundService == foregroundServiceEnabled) {
             return true;
@@ -1006,31 +922,48 @@ public class CapacitorIbeaconPlugin extends Plugin {
         return reconfigureForegroundService(wantForegroundService);
     }
 
-    // enableForegroundServiceScanning()/disableForegroundServiceScanning() may only be called
-    // while unbound. Re-registers any regions that were actively monitored/ranged before the cycle.
+    /*
+      enableForegroundServiceScanning() and disableForegroundServiceScanning() throw
+      IllegalStateException once anything is bound, and under autobind that means once any region is
+      being watched. So the regions come down, the service changes, and they go back up - which is
+      also what binds again, since stopping the last region is what released the binding in the first
+      place.
+    */
     private boolean reconfigureForegroundService(boolean wantForegroundService) {
-        boolean wasBound = beaconManagerBound;
-        if (wasBound && beaconConsumer != null) {
-            beaconManager.unbind(beaconConsumer);
-            beaconManagerBound = false;
+        boolean wasScanning = beaconManager.isAnyConsumerBound();
+        if (wasScanning) {
+            stopWatchingAllRegions();
         }
+
         boolean success = true;
         if (wantForegroundService) {
             success = enableForegroundServiceIfNeeded();
         } else {
             disableForegroundServiceIfNeeded();
         }
-        if (wasBound && beaconConsumer != null) {
-            beaconManagerBound = true;
-            beaconManager.bind(beaconConsumer);
-            for (Region region : monitoredRegions.values()) {
-                beaconManager.startMonitoring(region);
-            }
-            for (Region region : rangedRegions.values()) {
-                beaconManager.startRangingBeacons(region);
-            }
+
+        if (wasScanning) {
+            startWatchingAllRegions();
         }
         return success;
+    }
+
+    private void stopWatchingAllRegions() {
+        for (Region region : monitoredRegions.values()) {
+            beaconManager.stopMonitoring(region);
+        }
+        for (Region region : rangedRegions.values()) {
+            beaconManager.stopRangingBeacons(region);
+        }
+    }
+
+    private void startWatchingAllRegions() {
+        for (Region region : monitoredRegions.values()) {
+            beaconManager.startMonitoring(region);
+        }
+        for (Region region : rangedRegions.values()) {
+            beaconManager.startRangingBeacons(region);
+        }
     }
 
     private boolean enableForegroundServiceIfNeeded() {
