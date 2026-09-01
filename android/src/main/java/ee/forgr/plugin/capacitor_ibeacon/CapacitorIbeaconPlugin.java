@@ -140,12 +140,30 @@ public class CapacitorIbeaconPlugin extends Plugin {
                 // Prevent Android from downgrading long-running BLE scans to opportunistic mode
                 beaconManager.adjustSettings(new Settings.Builder().setLongScanForcingEnabled(true).build());
 
-                // Configure background scan periods (in milliseconds)
-                // Default background scan: 10 seconds scan, 5 minutes between scans
-                // We listen for most of the cycle rather than the 40% a 15 second gap left: a beacon
-                // heard in only some windows is otherwise taken for gone, and every spurious exit
-                // measured so far came from missing a few windows in a row - see REGION_EXIT_PERIOD.
-                beaconManager.setBackgroundBetweenScanPeriod(5000L); // 5 seconds between scans
+                /*
+                  Background scan periods, in milliseconds. AltBeacon's own defaults are 10s of
+                  scanning every 5 minutes - 3% of the time. A 30 second gap puts this at 25%, or
+                  roughly 15 minutes of radio per hour, around the clock.
+
+                  It was 5 seconds, which is 67% and closer to 40 minutes an hour, and the reasoning
+                  behind that turned out to be double-counting. The tight gap was added to stop
+                  spurious exits, on the grounds that a beacon heard in only some windows is taken
+                  for gone - and then REGION_EXIT_PERIOD was widened to three minutes for the same
+                  reason, which is the far cheaper of the two remedies and made the first redundant.
+
+                  The measurements are what settle it. Every spurious exit came from the phone's
+                  receiver going deaf for 60-80 seconds at a stretch, hearing nothing from any
+                  beacon; scanning more often during a deafness hears no more than scanning less
+                  often does. What answers it is the exit period being longer than the deafness, and
+                  three minutes is. Meanwhile a working scan hears a beacon in range every 1.3
+                  seconds, so a 10 second window has a hundred chances to notice it and needs
+                  nothing like 67% of the clock to succeed.
+
+                  What this does cost is entry latency: a beacon walked past is now noticed up to 30
+                  seconds later rather than up to 5. Exits are unaffected - REGION_EXIT_PERIOD is
+                  measured in wall-clock time since the beacon was last seen, not in missed windows.
+                */
+                beaconManager.setBackgroundBetweenScanPeriod(30000L); // 30 seconds between scans
                 beaconManager.setBackgroundScanPeriod(10000L); // 10 seconds scan duration
 
                 // Configure foreground scan periods
