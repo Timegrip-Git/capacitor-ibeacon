@@ -753,8 +753,11 @@ public class CapacitorIbeaconPlugin extends Plugin {
 
     @PluginMethod
     public void setBackgroundScanPeriod(PluginCall call) {
+        // The same values load() applies, so that omitting one of these does not quietly change it.
+        // A caller adjusting only scanPeriod used to have the gap fall from 30s to 15s underneath
+        // them, doubling the scan duty cycle as a side effect of a call about something else.
         long scanPeriod = longOptionFromCall(call, "scanPeriod", 10000L);
-        long betweenScanPeriod = longOptionFromCall(call, "betweenScanPeriod", 15000L);
+        long betweenScanPeriod = longOptionFromCall(call, "betweenScanPeriod", 30000L);
 
         try {
             beaconManager.setBackgroundScanPeriod(scanPeriod);

@@ -428,6 +428,14 @@ export interface BeaconRegion {
 
 /**
  * Background scan period configuration options (Android only).
+ *
+ * Both default to what the plugin already applies, so passing one of them does not silently move
+ * the other. The two together are a battery setting as much as a detection one: the scan runs for
+ * `scanPeriod` out of every `scanPeriod + betweenScanPeriod`, so the defaults below put the
+ * Bluetooth radio on for a quarter of the time, about 15 minutes an hour, for as long as background
+ * monitoring is enabled. Shortening the gap raises that in proportion - a 5 second gap is two
+ * thirds of the clock - and lengthening it costs entry latency rather than exits, which are decided
+ * by an exit period measured in wall-clock time since a beacon was last seen.
  */
 export interface BackgroundScanPeriodOptions {
   /**
@@ -438,7 +446,7 @@ export interface BackgroundScanPeriodOptions {
 
   /**
    * Duration between scan periods in milliseconds.
-   * Default: 15000 (15 seconds)
+   * Default: 30000 (30 seconds)
    */
   betweenScanPeriod?: number;
 }
