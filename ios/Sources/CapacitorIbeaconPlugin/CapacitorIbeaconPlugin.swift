@@ -48,7 +48,10 @@ public class CapacitorIbeaconPlugin: CAPPlugin, CAPBridgedPlugin {
             identifier: identifier,
             uuid: uuid,
             major: call.getInt("major"),
-            minor: call.getInt("minor")
+            minor: call.getInt("minor"),
+            // Off unless asked for: ranging is a continuous Bluetooth scan, and most callers of a
+            // monitoring API never read a didRangeBeacons event.
+            automaticRanging: call.getBool("enableAutomaticRanging") ?? false
         ) { result in
             switch result {
             case .success:

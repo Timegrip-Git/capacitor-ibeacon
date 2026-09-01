@@ -113,6 +113,31 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
     // a caller's stop must not cancel ranging that a region occupancy still justifies.
     var explicitRanging: Set<String> = []
     var automaticRanging: Set<String> = []
+
+    /*
+      Which identifiers asked for automatic ranging, and it is off unless one did.
+
+      This used to happen to every monitored region, and it is expensive in a way monitoring is not:
+      ranging is a continuous Bluetooth scan the app drives, where monitoring is handed to hardware
+      that Apple's own guidance calls the low-power option and asks you to prefer. Entering a region
+      therefore turned a cheap subscription into an expensive one for as long as the user stood in it
+      with the app open - whether or not anything was listening for didRangeBeacons, and with no way
+      to decline it short of not monitoring.
+
+      Persisted, because the regions themselves are. CLMonitor keeps its conditions across
+      termination and adopt() takes them back on the next launch, including a launch iOS made in the
+      background to deliver a crossing - which is before any frontend has run and could say again
+      what it wants. Without this that crossing would range or not range according to how the process
+      happened to start, and this plugin has enough of those.
+    */
+    var automaticRangingRequested: Set<String> = [] {
+        didSet {
+            guard automaticRangingRequested != oldValue else { return }
+            UserDefaults.standard.set(Array(automaticRangingRequested).sorted(),
+                                      forKey: CapacitorIbeacon.automaticRangingKey)
+        }
+    }
+    private static let automaticRangingKey = "CapacitorIbeacon.automaticRangingRequested"
     // Constraints currently ranging at the OS level, keyed by their canonical form, holding the very
     // object passed to startRangingBeacons so that stop can pass the same one.
     var activeRanging: [String: CLBeaconIdentityConstraint] = [:]
@@ -150,6 +175,10 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
         super.init()
         locationManager = CLLocationManager()
         locationManager.delegate = self
+        // Read before anything can adopt a condition or deliver an event for one.
+        automaticRangingRequested = Set(
+            UserDefaults.standard.stringArray(forKey: CapacitorIbeacon.automaticRangingKey) ?? []
+        )
         // peripheralManager intentionally not constructed here - see withReadyPeripheralManager().
     }
 
@@ -445,7 +474,9 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
 
     // MARK: - Monitoring API
 
-    public func startMonitoringForRegion(identifier: String, uuid: String, major: Int?, minor: Int?, completion: @escaping (Result<Void, Error>) -> Void) {
+    // The internal name differs from the label deliberately: `automaticRanging` is also the set of
+    // identifiers currently ranging that way, and shadowing it here would be a trap for the next edit.
+    public func startMonitoringForRegion(identifier: String, uuid: String, major: Int?, minor: Int?, automaticRanging wantsRanging: Bool = false, completion: @escaping (Result<Void, Error>) -> Void) {
         guard let beaconUUID = UUID(uuidString: uuid) else {
             completion(.failure(NSError(domain: "CapacitorIbeacon", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid UUID"])))
             return
@@ -470,6 +501,9 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
         let previous = rangingConstraints[identifier]
         conditions[identifier] = condition
         rangingConstraints[identifier] = constraint
+
+        // After the constraint is stored, because beginRanging() reads it.
+        setAutomaticRanging(wantsRanging, for: identifier)
 
         // Reconciled after the assignment, never before: the reconcile decides what should be ranging
         // from the constraints these identifiers now name, so it has to be reading the new one.
@@ -550,6 +584,38 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
     }
 
     /*
+      Records whether an identifier wants automatic ranging, and makes the answer true straight away.
+
+      Re-stated on every startMonitoringForRegion rather than only added, because a frontend
+      re-asserts its regions on every launch and that re-assertion is the only place the request can
+      be withdrawn again.
+
+      Applied at once rather than left to the next crossing: the region may already be occupied, and
+      an option that does nothing until the user walks out and back in reads as an option that does
+      not work.
+    */
+    private func setAutomaticRanging(_ wanted: Bool, for identifier: String) {
+        let wasRequested = automaticRangingRequested.contains(identifier)
+        if wanted {
+            automaticRangingRequested.insert(identifier)
+        } else {
+            automaticRangingRequested.remove(identifier)
+        }
+
+        guard wasRequested != wanted else { return }
+
+        if wanted {
+            // Only where there is a stay to range - beginRanging() is otherwise the wrong verb for
+            // a region nobody is standing in.
+            if announcedInside[identifier] == true {
+                beginRanging(for: identifier)
+            }
+        } else {
+            endRanging(for: identifier)
+        }
+    }
+
+    /*
       Retires the identifier altogether, ranging included.
 
       Ranging is reconciled after the constraint is forgotten, not before: the reconcile decides what
@@ -561,6 +627,9 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
     public func stopMonitoringForRegion(identifier: String, uuid: String) {
         explicitRanging.remove(identifier)
         automaticRanging.remove(identifier)
+        // Dropped with everything else, so that re-registering the identifier later has to ask for it
+        // again rather than inheriting a preference nobody restated.
+        automaticRangingRequested.remove(identifier)
         burstTimers[identifier]?.invalidate()
         burstTimers.removeValue(forKey: identifier)
         conditions.removeValue(forKey: identifier)

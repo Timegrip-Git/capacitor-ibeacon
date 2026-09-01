@@ -42,11 +42,17 @@ extension CapacitorIbeacon {
     }
 
     /*
-      Started on entering a region: for as long as the app is in the foreground, or for the length of
-      the wake window if the crossing arrived in the background. See backgroundBurstDuration.
+      Started on entering a region that asked for it: for as long as the app is in the foreground, or
+      for the length of the wake window if the crossing arrived in the background. See
+      backgroundBurstDuration.
+
+      Only for a region that asked. Ranging is a continuous Bluetooth scan and monitoring is not, so
+      doing this for every monitored region billed every caller for a feature most of them never
+      read - see automaticRangingRequested.
     */
     func beginRanging(for identifier: String) {
-        guard rangingConstraints[identifier] != nil else { return }
+        guard rangingConstraints[identifier] != nil,
+              automaticRangingRequested.contains(identifier) else { return }
 
         automaticRanging.insert(identifier)
         reconcileRanging()
@@ -81,7 +87,9 @@ extension CapacitorIbeacon {
     func refreshAutomaticRanging() {
         if CapacitorIbeacon.isForeground() {
             let inside = announcedInside.filter { $0.value }.map { $0.key }
-            automaticRanging = Set(inside.filter { rangingConstraints[$0] != nil })
+            automaticRanging = Set(inside.filter {
+                rangingConstraints[$0] != nil && automaticRangingRequested.contains($0)
+            })
         } else {
             burstTimers.values.forEach { $0.invalidate() }
             burstTimers.removeAll()

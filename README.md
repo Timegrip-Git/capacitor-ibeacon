@@ -136,8 +136,14 @@ the process that stops. No background mode, session object or keep-alive changes
 
 What the plugin does with that:
 
-- **In the foreground**, entering a monitored region starts ranging it automatically, and leaving
-  stops it. Backgrounding suspends it; returning resumes it.
+Automatic ranging is **off unless a region asks for it**, with `enableAutomaticRanging: true` on
+`startMonitoringForRegion`. Monitoring is handed to the OS and costs almost nothing; ranging is a
+continuous Bluetooth scan this app drives, and Apple's guidance is to prefer monitoring and to range
+only while you need the measurements. If you only consume `didEnterRegion` and `didExitRegion`,
+leaving it off saves the radio for as long as the user stands inside a region. With it on:
+
+- **In the foreground**, entering the region starts ranging it and leaving stops it. Backgrounding
+  suspends it; returning resumes it.
 - **In the background**, a crossing gets a single ~10 second burst of ranging - the wake window the
   monitoring event itself provides - which captures the beacon's proximity at the moment of the
   crossing and then stops. Nothing is kept alive artificially.
@@ -217,9 +223,10 @@ await CapacitorIbeacon.stopMonitoringForRegion({
 Start ranging beacons in a region. Provides continuous distance updates.
 
 On iOS this is foreground-only in practice - see [Ranging is a foreground feature on
-iOS](#ranging-is-a-foreground-feature-on-ios). Entering a monitored region already starts ranging it
-automatically while the app is in the foreground, so this call is for ranging a region you are not
-monitoring, or for keeping ranging on across a region exit.
+iOS](#ranging-is-a-foreground-feature-on-ios). A region monitored with `enableAutomaticRanging: true`
+already ranges itself while occupied and the app is in the foreground, so this call is for ranging a
+region you are not monitoring, for a region that did not ask for it, or for keeping ranging on across
+a region exit.
 
 ```typescript
 await CapacitorIbeacon.startRangingBeaconsInRegion({

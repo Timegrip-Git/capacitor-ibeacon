@@ -45,9 +45,11 @@ export interface CapacitorIbeaconPlugin extends Plugin {
    *
    * iOS: ranging only produces measurements while the app process is running, and iOS suspends it
    * shortly after it leaves the foreground - background ranging is not supported by the platform.
-   * Entering a monitored region already starts ranging automatically while the app is in the
-   * foreground, and a background crossing gets a short burst instead. This call is tracked
-   * separately from that automatic behaviour, so a region exit never cancels ranging you asked for.
+   * A region monitored with `enableAutomaticRanging: true` already ranges itself while occupied and
+   * the app is in the foreground, and a background crossing gets a short burst instead. This call is
+   * tracked separately from that automatic behaviour, so a region exit never cancels ranging you
+   * asked for, and it works for regions that did not ask for automatic ranging or are not monitored
+   * at all.
    *
    * @param options - Region to range beacons in
    * @returns Promise that resolves when ranging starts
@@ -424,6 +426,26 @@ export interface BeaconRegion {
    * When true, the plugin will keep scanning in background using a foreground service.
    */
   enableBackgroundMode?: boolean;
+
+  /**
+   * Range this region automatically while it is occupied (iOS only). Defaults to `false`.
+   *
+   * When enabled, entering the region starts ranging it and leaving stops it, so `didRangeBeacons`
+   * arrives for as long as the user is inside with the app in the foreground; a crossing delivered
+   * in the background gets a single short burst instead. See the README section "Ranging is a
+   * foreground feature on iOS".
+   *
+   * Off by default because it is not free. Monitoring is handed to the OS and costs almost nothing;
+   * ranging is a continuous Bluetooth scan that this app drives, and Apple's guidance is to prefer
+   * monitoring and to range only while the measurements are needed. Turn this on if you actually
+   * read `didRangeBeacons` - if all you need is enter and exit, leaving it off saves the radio.
+   *
+   * Independent of `startRangingBeaconsInRegion`, which always does what it is told: an exit will
+   * not cancel ranging you asked for explicitly, and turning this off will not cancel it either.
+   *
+   * @platform iOS
+   */
+  enableAutomaticRanging?: boolean;
 }
 
 /**
