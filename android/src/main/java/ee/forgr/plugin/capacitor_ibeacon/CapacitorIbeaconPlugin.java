@@ -374,6 +374,7 @@ public class CapacitorIbeaconPlugin extends Plugin {
                 beaconManager.stopMonitoring(region);
                 monitoredRegions.remove(identifier);
             }
+            releaseIfNothingLeftToWatch();
             call.resolve();
         } catch (Exception e) {
             call.reject("Failed to stop monitoring", e);
@@ -423,6 +424,7 @@ public class CapacitorIbeaconPlugin extends Plugin {
                 beaconManager.stopRangingBeacons(region);
                 rangedRegions.remove(identifier);
             }
+            releaseIfNothingLeftToWatch();
             call.resolve();
         } catch (Exception e) {
             call.reject("Failed to stop ranging", e);
@@ -907,6 +909,25 @@ public class CapacitorIbeaconPlugin extends Plugin {
         // once onBeaconServiceConnect() fires.
         beaconManagerBound = true;
         beaconManager.bind(beaconConsumer);
+    }
+
+    /*
+      Lets go of everything once the last region is gone.
+
+      The binding, the scan and the foreground service with its notification all exist to serve the
+      two maps above, and not one of them stops when the last entry is removed - so unticking the
+      final beacon left a permanent notification saying "Scanning for nearby beacons" over a scan
+      with nothing left to find. Only destroying the Activity cleared it, and with a foreground
+      service holding the process up that need never happen.
+
+      Safe to call when the maps were already empty: unbindIfNeeded() is idempotent, and there is
+      nothing being served in that state either. Whatever comes next calls bindIfNeeded(), which
+      brings the binding and the service back with it.
+    */
+    private void releaseIfNothingLeftToWatch() {
+        if (monitoredRegions.isEmpty() && rangedRegions.isEmpty()) {
+            unbindIfNeeded();
+        }
     }
 
     private void unbindIfNeeded() {
