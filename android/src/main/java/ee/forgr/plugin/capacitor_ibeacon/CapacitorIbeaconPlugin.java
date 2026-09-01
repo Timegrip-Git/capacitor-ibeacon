@@ -2,6 +2,7 @@ package ee.forgr.plugin.capacitor_ibeacon;
 
 import android.Manifest;
 import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.ServiceConnection;
@@ -711,7 +712,7 @@ public class CapacitorIbeaconPlugin extends Plugin {
     @PluginMethod
     public void isBluetoothEnabled(PluginCall call) {
         JSObject ret = new JSObject();
-        BluetoothAdapter bluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
+        BluetoothAdapter bluetoothAdapter = bluetoothAdapter();
         ret.put("enabled", bluetoothAdapter != null && bluetoothAdapter.isEnabled());
         call.resolve(ret);
     }
@@ -719,9 +720,19 @@ public class CapacitorIbeaconPlugin extends Plugin {
     @PluginMethod
     public void isRangingAvailable(PluginCall call) {
         JSObject ret = new JSObject();
-        BluetoothAdapter bluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
-        ret.put("available", bluetoothAdapter != null);
+        ret.put("available", bluetoothAdapter() != null);
         call.resolve(ret);
+    }
+
+    /*
+      BluetoothAdapter.getDefaultAdapter() is deprecated, and was never quite right either: it
+      answers for the process rather than for a context, which is why the platform replaced it with
+      an adapter obtained from the system service. Null where the device has no Bluetooth at all,
+      which is what isRangingAvailable() reports.
+    */
+    private BluetoothAdapter bluetoothAdapter() {
+        BluetoothManager manager = getContext().getSystemService(BluetoothManager.class);
+        return manager == null ? null : manager.getAdapter();
     }
 
     /*
