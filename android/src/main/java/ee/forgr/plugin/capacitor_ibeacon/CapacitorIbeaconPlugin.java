@@ -58,10 +58,35 @@ public class CapacitorIbeaconPlugin extends Plugin {
       phone's receiver, not the beacons. AltBeacon's own default of 10s is far below that, and 60s
       still produced an exit followed by an enter 28 milliseconds later.
 
-      Three minutes covers all but that outlier, at the price of reporting a genuine exit that much
-      later. That is the better error: a late exit is still true, a spurious one never was.
+      Three minutes covered all but that outlier, and for as long as this plugin was the thing
+      deciding what a real departure was, that was the better error: a late exit is still true, a
+      spurious one never was.
+
+      It is no longer the thing deciding. Holding and debouncing moved off the client entirely,
+      because neither platform can keep a timer honestly while the device sleeps and two platforms
+      failing differently is not parity. What the client owes the server now is what it saw, when it
+      saw it - and three minutes of silence before saying so is the largest piece of judgement left
+      in the pipeline, applied on one platform only. iOS has no equivalent: CLMonitor decides on a
+      schedule of its own that nothing here can set.
+
+      So this comes down to a minute, which is the floor rather than a preference. A region counts as
+      exited on "not seen for longer than this", evaluated at the end of a scan cycle, and the
+      background cycle is 40 seconds - so 60 seconds tolerates a single missed listening window and
+      no more. Going lower would declare an exit before the next window could contradict it; going
+      higher starts withholding again.
+
+      Read the paragraph above literally: those 60-80 second deaf spells will now produce exits,
+      reliably, and each will be followed by an enter when the receiver recovers. That is intended.
+      This value was tried before and rejected for exactly that - "60s still produced an exit
+      followed by an enter 28 milliseconds later" was written as a reason against it. The behaviour
+      has not changed; what changed is who is supposed to be judging it. A flap the server can see is
+      worth more than a flap the client hid, and the server can be given a window that is both long
+      and reliable, which nothing here can.
+
+      This is only half paid for until that server-side debounce exists. Until then the endpoint sees
+      the flapping and nothing absorbs it.
     */
-    private static final long REGION_EXIT_PERIOD = 180000L;
+    private static final long REGION_EXIT_PERIOD = 60000L;
 
     // A scan outlives the Activity that started it: foreground service scanning keeps the process,
     // the service binding and the BeaconManager singleton alive while the Activity - and with it this
@@ -143,14 +168,16 @@ public class CapacitorIbeaconPlugin extends Plugin {
                   It was 5 seconds, which is 67% and closer to 40 minutes an hour, and the reasoning
                   behind that turned out to be double-counting. The tight gap was added to stop
                   spurious exits, on the grounds that a beacon heard in only some windows is taken
-                  for gone - and then REGION_EXIT_PERIOD was widened to three minutes for the same
-                  reason, which is the far cheaper of the two remedies and made the first redundant.
+                  for gone - and then REGION_EXIT_PERIOD was widened for the same reason, which was
+                  the far cheaper of the two remedies and made the first redundant. That period has
+                  since come back down to 60 seconds, but not because the tight gap was needed again:
+                  the client stopped being the thing that decides what a departure is at all.
 
                   The measurements are what settle it. Every spurious exit came from the phone's
                   receiver going deaf for 60-80 seconds at a stretch, hearing nothing from any
                   beacon; scanning more often during a deafness hears no more than scanning less
                   often does. What answers it is the exit period being longer than the deafness, and
-                  three minutes is. Meanwhile a working scan hears a beacon in range every 1.3
+                  the exit period is. Meanwhile a working scan hears a beacon in range every 1.3
                   seconds, so a 10 second window has a hundred chances to notice it and needs
                   nothing like 67% of the clock to succeed.
 
