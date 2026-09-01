@@ -245,6 +245,16 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
             return
         }
 
+        /*
+          The wait is over, however this call got here, so the observer goes.
+
+          It was never removed, and the notification it waits for is not a one-off: protected data
+          becomes unavailable on every lock and available again on every unlock, so the observer went
+          on firing for the life of the process to call a function whose first line returns. Harmless
+          work, but work, and an observer outliving its purpose is how the next one gets missed.
+        */
+        stopObservingProtectedData()
+
         monitorTask = Task { [weak self] in
             let monitor = await CLMonitor(CapacitorIbeacon.monitorName)
 
@@ -281,6 +291,12 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
                 beaconLog("CapacitorIbeacon: monitor event stream FAILED: %@", error.localizedDescription)
             }
         }
+    }
+
+    private func stopObservingProtectedData() {
+        guard let observer = protectedDataObserver else { return }
+        NotificationCenter.default.removeObserver(observer)
+        protectedDataObserver = nil
     }
 
     private func adopt(_ adopted: [AdoptedCondition]) {
