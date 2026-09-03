@@ -495,12 +495,34 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
         }
     }
 
-    // The constraint is the fallback, not an afterthought: an identifier can be ranged without ever
-    // being monitored, and the payload has always carried a uuid.
+    /*
+      The constraint is the fallback, not an afterthought: an identifier can be ranged without ever
+      being monitored, and the payload has always carried a uuid.
+
+      One store or the other, though, never a blend. Reading each value with its own `??` across the
+      two reads naturally and is wrong: a uuid-only monitored region would borrow the major of a
+      narrower ranging constraint and report an identity nobody registered.
+
+      major and minor are omitted rather than sent as null where the region does not constrain them,
+      so that "matches any major" cannot be read as "the major is nothing". Where they are present
+      they are exact, even though nothing here decodes a packet: a crossing on a fully specified
+      region can only have been caused by a beacon advertising that triple. The OS never says which
+      beacon matched, and with no wildcards left it does not have to.
+    */
     func regionPayload(_ identifier: String) -> [String: Any] {
         var payload: [String: Any] = ["identifier": identifier]
-        if let uuid = conditions[identifier]?.uuid ?? rangingConstraints[identifier]?.uuid {
-            payload["uuid"] = uuid.uuidString
+
+        guard let constraint = conditions[identifier].map(CapacitorIbeacon.constraint(from:))
+                ?? rangingConstraints[identifier] else {
+            return payload
+        }
+
+        payload["uuid"] = constraint.uuid.uuidString
+        if let major = constraint.major {
+            payload["major"] = Int(major)
+        }
+        if let minor = constraint.minor {
+            payload["minor"] = Int(minor)
         }
         return payload
     }
