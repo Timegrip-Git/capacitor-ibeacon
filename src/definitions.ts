@@ -412,6 +412,8 @@ export interface BeaconRegion {
 
   /**
    * UUID of the beacon(s) to detect.
+   *
+   * Accepted in any case. Reported back in upper case, on both platforms.
    */
   uuid: string;
 
@@ -512,7 +514,7 @@ export interface BeaconAdvertisingOptions {
  */
 export interface Beacon {
   /**
-   * Beacon UUID.
+   * Beacon UUID, in upper case on both platforms.
    */
   uuid: string;
 

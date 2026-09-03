@@ -18,6 +18,7 @@ import com.getcapacitor.annotation.PermissionCallback;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import org.altbeacon.beacon.Beacon;
@@ -839,12 +840,24 @@ public class CapacitorIbeaconPlugin extends Plugin {
         notifyListeners("didRangeBeacons", ret);
     }
 
+    /*
+      Upper case, whatever the platform.
+
+      Identifier.toString() writes a 16-byte id the way RFC 4122 wants it, in lower case, while
+      UUID.uuidString on iOS writes it in upper case and offers nothing else. The same beacon has to
+      be the same string on both or anything grouping by uuid counts it twice, so the side with a
+      choice is the side that gives way.
+    */
+    private static String uuidOf(Identifier identifier) {
+        return identifier.toString().toUpperCase(Locale.ROOT);
+    }
+
     private JSObject serializeRegion(Region region) {
         JSObject obj = new JSObject();
         obj.put("identifier", region.getUniqueId());
 
         if (region.getId1() != null) {
-            obj.put("uuid", region.getId1().toString());
+            obj.put("uuid", uuidOf(region.getId1()));
         }
         if (region.getId2() != null) {
             obj.put("major", region.getId2().toInt());
@@ -863,7 +876,7 @@ public class CapacitorIbeaconPlugin extends Plugin {
             JSObject obj = new JSObject();
 
             if (beacon.getId1() != null) {
-                obj.put("uuid", beacon.getId1().toString());
+                obj.put("uuid", uuidOf(beacon.getId1()));
             }
             if (beacon.getId2() != null) {
                 obj.put("major", beacon.getId2().toInt());
