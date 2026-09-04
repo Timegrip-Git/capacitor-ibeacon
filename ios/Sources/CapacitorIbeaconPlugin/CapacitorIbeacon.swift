@@ -858,6 +858,20 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
         request: @escaping () -> Void
     ) {
         let current = currentAuthorizationStatus()
+        let targetName = target == .authorizedAlways ? "always" : "when-in-use"
+
+        /*
+          Stated on the way in, because a permission dialog is the one thing this plugin does that the
+          user sees, and nothing else in the log says where it came from.
+
+          Every prompt this plugin can raise passes through here - it is the only funnel to
+          requestWhenInUseAuthorization() and to the session take that asks for always - so a dialog
+          with no line like this in front of it did not come from this plugin, and one with a line in
+          front of it names the moment the frontend asked. Without that, an unexpected prompt is a
+          question no log can answer and everyone gets to blame the beacons.
+        */
+        beaconLog("CapacitorIbeacon: >> %@ authorization requested by the frontend, currently %@, app %@",
+                  targetName, getAuthorizationStatus(), CapacitorIbeacon.applicationStateName())
 
         /*
           Answered already, so nothing is asked and the completion is settled from what is known.
@@ -886,6 +900,8 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
             if current == .authorizedAlways, target == .authorizedAlways {
                 takeServiceSession(recordAsConfigured: true)
             }
+            beaconLog("CapacitorIbeacon: %@ authorization %@ - answered from what is known, no prompt raised",
+                      targetName, refused ? "refused already" : "held already")
             completion(getAuthorizationStatus())
             return
         }
@@ -893,6 +909,8 @@ public class CapacitorIbeacon: NSObject, CLLocationManagerDelegate, CBPeripheral
         let token = UUID()
         authorizationTarget = target
         authorizationCallbacks[token] = completion
+        beaconLog("CapacitorIbeacon: %@ authorization undecided - asking iOS, a prompt is expected now",
+                  targetName)
         request()
 
         // This request's own deadline, and nobody else's.
